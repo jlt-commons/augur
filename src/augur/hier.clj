@@ -18,8 +18,9 @@
   summed (bottom up) and its state scales the rates of every leaf under it
   (top down). The states are filtered by a Kalman filter on the Laplace
   approximation (Fahrmeir & Wagenpfeil 1997), and each level's persistence
-  and size chosen from grids by the filter's own one-step-ahead predictive
-  likelihood of the counts (prequential, Dawid 1984): a level whose states
+  and size chosen from grids by the filter's own predictive likelihood of
+  the counts at the horizon the states are used at (prequential, Dawid
+  1984): a level whose states
   do not help forecast the next period's counts gets size zero and drops
   out. EM for these variances stalls where a level is weakly identified,
   which the grid does not. States are defined so the multiplier
@@ -112,17 +113,21 @@
 (defn- run-filter
   "The forward pass: per node, arrays over t0..t1 of the filtered means and
   variances, and :ll, the sum over periods of the log predictive
-  probability of the period's counts given the periods before (less the
-  log factorials), jointly over the states the leaves share: scoring each
-  leaf alone counts a shared state's uncertainty once per leaf and so
-  favours large noisy states. At each period every state is predicted,
-  then each level in turn, from the top, is updated by Newton steps on its
+  probability of the period's counts (less the log factorials) given the
+  periods up to `horizon` before it, the states filtered then and run
+  forward: the horizon a forecast made from these states looks ahead.
+  It is taken jointly over the states the leaves share (scoring each leaf
+  alone counts a shared state's uncertainty once per leaf, and favours
+  large noisy states), by Laplace's approximation at the mode, its log
+  determinant node by node. At each period every state is predicted, then
+  each level in turn, from the top, is updated by Newton steps on its
   leaves' counts given the other levels (two Gauss-Seidel passes). A level
   of size zero stays at zero."
-  [{:keys [rho q nodes ^ints lvl obs-at]} t0 t1]
+  [{:keys [rho q nodes ^ints lvl obs-at]} t0 t1 horizon]
   (let [T (inc (- (long t1) (long t0)))
         N (count nodes)
         L (count rho)
+        h (long horizon)
         ^doubles rr (double-array rho)
         ^doubles qq (double-array q)
         ^doubles mf (double-array (* N T))
@@ -130,15 +135,66 @@
         ^doubles cur (double-array N)
         ^doubles cv (double-array N)
         ^doubles hv (double-array N)
+        ^doubles st (double-array N)
         ;; per node, the sums of its leaves' counts and rates at a period
         ^doubles sy (double-array N)
         ^doubles se (double-array N)
         ^doubles m0 (double-array N)
         ^doubles p0 (double-array N)
-        ll (double-array 1)]
+        ;; the states as seen from `horizon` periods before, for scoring
+        ^doubles hm (double-array N)
+        ^doubles hp (double-array N)
+        ^doubles tc (double-array N)
+        ^doubles tv (double-array N)
+        ll (double-array 1)
+        ;; the mode of the states given a period's counts under prior (pm, pv),
+        ;; into (sc, sv), starting from sc
+        mode! (fn [[^objects paths ^doubles ys ^doubles es] ^doubles pm ^doubles pv ^doubles sc ^doubles sv]
+                (let [n (alength ys)
+                      lin (fn ^double [^ints path]
+                            (loop [j 0 acc 0.0] (if (< j (alength path)) (let [v (aget path j)] (recur (inc j) (+ acc (- (aget sc v) (aget hv v))))) acc)))]
+                  (dotimes [_ 2]
+                    (dotimes [l L]
+                      (when (pos? (aget qq l))
+                        (java.util.Arrays/fill sy 0.0) (java.util.Arrays/fill se 0.0)
+                        (dotimes [k n]
+                          (let [^ints path (aget paths k)
+                                v (aget path l)]
+                            (aset sy v (+ (aget sy v) (aget ys k)))
+                            ;; the rate without v's own state
+                            (aset se v (+ (aget se v) (* (aget es k) (Math/exp (- (double (lin path)) (aget sc v))))))))
+                        (dotimes [v N]
+                          (when (and (= l (aget lvl v)) (pos? (aget se v)))
+                            (let [y (aget sy v) e (aget se v) mm (aget pm v) pp (aget pv v)
+                                  s (loop [k 0 s (aget sc v)]
+                                      (let [r (* e (Math/exp s))
+                                            g (- y r (/ (- s mm) pp))
+                                            hh (+ r (/ 1.0 pp))
+                                            s' (+ s (/ g hh))]
+                                        (if (and (< k 20) (> (Math/abs (- s' s)) 1e-10)) (recur (inc k) s') s')))]
+                              (aset sc v s)
+                              (aset sv v (/ 1.0 (+ (* e (Math/exp s)) (/ 1.0 pp))))))))))))
+        ;; the log predictive of a period's counts under prior (pm, pv), at its mode sc
+        score (fn ^double [[^objects paths ^doubles ys ^doubles es] ^doubles pm ^doubles pv ^doubles sc]
+                (java.util.Arrays/fill se 0.0)
+                (let [n (alength ys)
+                      acc (double-array 1)]
+                  (dotimes [k n]
+                    (let [^ints path (aget paths k)
+                          mu (+ (Math/log (aget es k))
+                                (loop [j 0 a 0.0] (if (< j (alength path)) (let [v (aget path j)] (recur (inc j) (+ a (- (aget sc v) (aget hv v))))) a)))
+                          r (Math/exp mu)]
+                      (aset acc 0 (+ (aget acc 0) (- (* (aget ys k) mu) r)))
+                      (dotimes [j (alength path)]
+                        (let [v (aget path j)] (aset se v (+ (aget se v) r))))))
+                  (dotimes [v N]
+                    (when (and (pos? (aget qq (aget lvl v))) (pos? (aget se v)))
+                      (let [d (- (aget sc v) (aget pm v)) pp (aget pv v)]
+                        (aset acc 0 (- (aget acc 0) (/ (* d d) (* 2.0 pp)) (* 0.5 (Math/log1p (* pp (aget se v)))))))))
+                  (aget acc 0)))]
     (dotimes [v N]
-      (let [l (aget lvl v) st (stationary (aget rr l) (aget qq l))]
-        (aset hv v (* 0.5 st)) (aset cv v st)))
+      (let [l (aget lvl v) s (stationary (aget rr l) (aget qq l))]
+        (aset st v s) (aset hv v (* 0.5 s)) (aset cv v s)))
     (dotimes [i T]
       (let [here (get obs-at (+ (long t0) i))]
         ;; predict
@@ -148,51 +204,22 @@
             (aset cv v (+ (* r r (aget cv v)) (aget qq l)))
             (aset m0 v (aget cur v)) (aset p0 v (aget cv v))))
         (when here
-          (let [[^objects paths ^doubles ys ^doubles es] here
-                n (alength ys)
-                lin (fn ^double [^ints path]
-                      (loop [j 0 acc 0.0] (if (< j (alength path)) (let [v (aget path j)] (recur (inc j) (+ acc (- (aget cur v) (aget hv v))))) acc)))]
-            ;; update, level by level, twice
-            (dotimes [_ 2]
-              (dotimes [l L]
-                (when (pos? (aget qq l))
-                  (java.util.Arrays/fill sy 0.0) (java.util.Arrays/fill se 0.0)
-                  (dotimes [k n]
-                    (let [^ints path (aget paths k)
-                          v (aget path l)]
-                      (aset sy v (+ (aget sy v) (aget ys k)))
-                      ;; the rate without v's own state
-                      (aset se v (+ (aget se v) (* (aget es k) (Math/exp (- (double (lin path)) (aget cur v))))))))
-                  (dotimes [v N]
-                    (when (and (= l (aget lvl v)) (pos? (aget se v)))
-                      (let [y (aget sy v) e (aget se v) mm (aget m0 v) pp (aget p0 v)
-                            s (loop [k 0 s (aget cur v)]
-                                (let [r (* e (Math/exp s))
-                                      g (- y r (/ (- s mm) pp))
-                                      h (+ r (/ 1.0 pp))
-                                      s' (+ s (/ g h))]
-                                  (if (and (< k 20) (> (Math/abs (- s' s)) 1e-10)) (recur (inc k) s') s')))]
-                        (aset cur v s)
-                        (aset cv v (/ 1.0 (+ (* e (Math/exp s)) (/ 1.0 pp))))))))))))
-        ;; the period's counts' log predictive probability, jointly over
-        ;; the states they share: Laplace's approximation at the mode the
-        ;; update found, its log determinant taken node by node
-        (when here
-          (let [[^objects paths ^doubles ys ^doubles es] here
-                n (alength ys)]
-            (java.util.Arrays/fill se 0.0)
-            (dotimes [k n]
-              (let [^ints path (aget paths k)
-                    mu (+ (Math/log (aget es k))
-                          (loop [j 0 acc 0.0] (if (< j (alength path)) (let [v (aget path j)] (recur (inc j) (+ acc (- (aget cur v) (aget hv v))))) acc)))
-                    r (Math/exp mu)]
-                (aset ll 0 (+ (aget ll 0) (- (* (aget ys k) mu) r)))
-                (dotimes [j (alength path)]
-                  (let [v (aget path j)] (aset se v (+ (aget se v) r))))))
-            (dotimes [v N]
-              (when (and (pos? (aget qq (aget lvl v))) (pos? (aget se v)))
-                (let [d (- (aget cur v) (aget m0 v)) pp (aget p0 v)]
-                  (aset ll 0 (- (aget ll 0) (/ (* d d) (* 2.0 pp)) (* 0.5 (Math/log1p (* pp (aget se v)))))))))))
+          (if (= h 1)
+            (do (mode! here m0 p0 cur cv)
+                (aset ll 0 (+ (aget ll 0) (double (score here m0 p0 cur)))))
+            (do
+              ;; the states filtered `horizon` periods before, run forward
+              (dotimes [v N]
+                (let [r (aget rr (aget lvl v))
+                      rh (Math/pow r h)
+                      j (- i h)
+                      [m p] (if (neg? j) [0.0 (aget st v)] [(aget mf (+ (* v T) j)) (aget pf (+ (* v T) j))])]
+                  (aset hm v (* rh (double m)))
+                  (aset hp v (+ (* rh rh (double p)) (* (aget st v) (- 1.0 (* rh rh)))))
+                  (aset tc v (aget hm v)) (aset tv v (aget hp v))))
+              (mode! here hm hp tc tv)
+              (aset ll 0 (+ (aget ll 0) (double (score here hm hp tc))))
+              (mode! here m0 p0 cur cv))))
         (dotimes [v N]
           (aset mf (+ (* v T) i) (aget cur v))
           (aset pf (+ (* v T) i) (aget cv v)))))
@@ -224,20 +251,22 @@
   half its level's stationary variance). Each state is AR(1) around zero,
   with its level's persistence rho and stationary sd. Each level's pair is
   chosen in turn, from the top, `:passes` times, from the grids `:rhos`
-  and `:sds` (and the current pair), by the one-step-ahead predictive log
-  likelihood of the counts, less :penalty for each level whose states have
+  and `:sds` (and the current pair), by the predictive log likelihood of
+  the counts `:horizon` periods ahead (the horizon the states will be used
+  at: choosing persistence on one step ahead favours states that chase
+  the last wave), less :penalty for each level whose states have
   a size (2.0, Akaike's price of its two parameters, makes a level earn
   its place). Options, all required: :rho and :sd, the starting pairs per
-  level, :rhos, :sds, :passes and :penalty. Returns the fit, its
+  level, :rhos, :sds, :passes, :penalty and :horizon. Returns the fit, its
   :rho, :sd and :q (innovation variances) and :ll, filtered (every state
   uses only the periods up to its own)."
-  [obs paths [t0 t1] {:keys [rho sd rhos sds passes penalty]}]
-  (when-not (and rho sd rhos sds passes penalty)
-    (throw (ex-info "augur.hier/states needs :rho :sd :rhos :sds :passes :penalty" {})))
+  [obs paths [t0 t1] {:keys [rho sd rhos sds passes penalty horizon]}]
+  (when-not (and rho sd rhos sds passes penalty horizon)
+    (throw (ex-info "augur.hier/states needs :rho :sd :rhos :sds :passes :penalty :horizon" {})))
   (let [st (structure obs paths)
         L (count rho)
-        run (fn [rho sd] (let [cfg (assoc st :rho rho :sd sd :q (q-of rho sd))
-                               f (run-filter cfg t0 t1)]
+        run (fn [rho sd] (let [cfg (assoc st :rho rho :sd sd :q (q-of rho sd) :horizon horizon)
+                               f (run-filter cfg t0 t1 horizon)]
                            (merge cfg f {:t0 t0 :t1 t1
                                          :score (- (double (:ll f)) (* (double penalty) (count (filter pos? sd))))})))]
     (loop [pass 0 best (run (mapv double rho) (mapv double sd))]
@@ -255,8 +284,8 @@
   "The filter of `fit`'s hyperparameters run over other counts."
   [fit obs [t0 t1]]
   (let [st (structure obs (:paths fit))
-        cfg (merge st (select-keys fit [:rho :sd :q]))]
-    (merge cfg (run-filter cfg t0 t1) {:t0 t0 :t1 t1})))
+        cfg (merge st (select-keys fit [:rho :sd :q :horizon]))]
+    (merge cfg (run-filter cfg t0 t1 (:horizon cfg 1)) {:t0 t0 :t1 t1})))
 
 (defn state-mean
   "Node v's filtered state at t."

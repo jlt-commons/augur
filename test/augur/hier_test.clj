@@ -68,7 +68,7 @@
 
 (def paths (into {} (for [[r s l] leaves] [l ["world" r s l]])))
 
-(def opts {:rho [0.5 0.5 0.5 0.5] :sd [0.2 0.2 0.2 0.2] :rhos [0.5 0.8 0.95] :sds [0.0 0.1 0.2 0.4 0.8] :passes 2 :penalty 2.0})
+(def opts {:rho [0.5 0.5 0.5 0.5] :sd [0.2 0.2 0.2 0.2] :rhos [0.5 0.8 0.95] :sds [0.0 0.1 0.2 0.4 0.8] :passes 2 :penalty 2.0 :horizon 1})
 
 (defn- corr [xs ys]
   (let [n (count xs) mx (/ (reduce + xs) n) my (/ (reduce + ys) n)
@@ -124,3 +124,14 @@
     (testing "with states far from now, the mean multiplier is one and sharing only adds variance"
       (let [far (h/any-probability fit (select-keys paths members) ps 119 [400 403] {:draws 4000 :seed 1})]
         (is (< far (+ indep 0.01)) [far indep])))))
+
+(deftest states-are-chosen-at-the-horizon-they-serve
+  ;; the settings chosen to forecast eight periods out forecast eight
+  ;; periods out at least as well as those chosen for the next period
+  (let [{:keys [obs]} (simulate 5 200 0.5 0.6)
+        near (h/states obs paths [0 199] opts)
+        far (h/states obs paths [0 199] (assoc opts :horizon 8))
+        near-at-8 (h/states obs paths [0 199] (assoc opts :horizon 8 :rho (:rho near) :sd (:sd near) :passes 0))]
+    (is (>= (:score far) (:score near-at-8)))
+    (testing "the horizon changes what is scored"
+      (is (not= (:ll near) (:ll near-at-8))))))
