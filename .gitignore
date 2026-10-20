@@ -1,0 +1,4 @@
+.jolt/
+.cpcache/
+.clj-kondo/.cache/
+.lsp/

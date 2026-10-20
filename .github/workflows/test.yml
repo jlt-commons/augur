@@ -1,0 +1,67 @@
+name: test
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-linux
+            shell: bash
+          - os: macos-latest
+            target: aarch64-macos
+            shell: bash
+          - os: windows-latest
+            target: x86_64-windows
+            shell: msys2 {0}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up MSYS2
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          path-type: inherit
+          install: curl unzip
+
+      # The nightly jolt by default; the JOLT_PIN repository variable pins a
+      # release such as v0.8.23.
+      - name: Install jolt
+        env:
+          JOLT_PIN: ${{ vars.JOLT_PIN }}
+        run: |
+          ver="${JOLT_PIN:-vnightly}"
+          dest="$HOME/.jolt-dist"
+          mkdir -p "$dest"
+          base="https://github.com/jolt-lang/jolt/releases/download/${ver}/jolt-${ver}-${{ matrix.target }}"
+          case "${{ matrix.target }}" in
+            *windows)
+              curl -fsSL -o jolt.zip "${base}.zip"
+              unzip -q jolt.zip -d "$dest"
+              exe=$(find "$dest" -name jolt.exe | head -1) ;;
+            *)
+              curl -fsSL -o jolt.tar.gz "${base}.tar.gz"
+              tar xzf jolt.tar.gz -C "$dest"
+              exe=$(find "$dest" -name jolt -type f -perm -u+x | head -1) ;;
+          esac
+          [ -n "$exe" ] || { echo "no jolt binary in the ${ver} archive"; exit 1; }
+          dir=$(dirname "$exe")
+          # GITHUB_PATH takes a Windows path, which an MSYS2 shell has to convert to
+          if command -v cygpath >/dev/null; then dir=$(cygpath -w "$dir"); fi
+          echo "$dir" >> "$GITHUB_PATH"
+          "$exe" --version
+
+      - name: Test
+        run: jolt -A:test -M

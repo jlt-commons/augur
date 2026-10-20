@@ -1,0 +1,8 @@
+{:jolt/min-version "0.8.16"
+
+ ;; No dependencies: plain Jolt (clojure.core and Math).
+ :paths ["src"]
+
+ :aliases
+ {:test {:extra-paths ["test"]
+         :main-opts ["-m" "augur.test-runner"]}}}
