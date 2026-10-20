@@ -65,3 +65,22 @@
     (is (= (logit/predict beta (:x (first rows))) (logit/predict state (vec (:x (first rows)))))
         "predict takes either form")
     (is (thrown? Exception (logit/fit rows 3 {})) ":prior is required")))
+
+(deftest offsets-are-fixed-parts-of-the-linear-predictor
+  ;; y depends on x1 and a known per-row offset; fitting with the offset
+  ;; recovers the same slope as fitting it as an input whose coefficient is 1
+  (let [g (m/rng 7)
+        rows (vec (for [_ (range 4000)]
+                    (let [x1 (m/normal! g) o (* 2.0 (m/normal! g))
+                          p (m/expit (+ -2.0 (* 1.0 x1) o))]
+                      {:x (double-array [1.0 x1]) :o o :y (< (m/next-double! g) p) :w 1.0})))
+        with (logit/fit rows 2 {:prior 0.01})
+        without (logit/fit (map #(dissoc % :o) rows) 2 {:prior 0.01})]
+    (is (< 0.85 (aget with 1) 1.15) (vec with))
+    (is (< -2.2 (aget with 0) -1.8) (vec with))
+    (testing "ignoring the offset attenuates the slope"
+      (is (< (aget without 1) (aget with 1))))
+    (testing "predict adds the offset"
+      (is (< (Math/abs (- (logit/predict with [1.0 0.5] 1.5)
+                          (m/expit (+ (aget with 0) (* 0.5 (aget with 1)) 1.5))))
+             1e-12)))))

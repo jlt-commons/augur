@@ -50,7 +50,8 @@ out as its own library.
 | `augur.layer` | A child's prior from its parent's posterior at a fixed strength, folded over any number of layers, with an explanation of how much is the child's own |
 | `augur.ledger` | Forecasts registered and resolved later: Brier and log scores against benchmarks, decayed per key, recalibration from the key's record, rows for refitting; bounded |
 | `augur.calibrate` | Recalibrating probabilities: an online binned table with forgetting, the isotonic (CORP) map, the logistic map |
-| `augur.logit` | Weighted Bayesian logistic regression: ridge or horseshoe-like shrinkage |
+| `augur.logit` | Weighted Bayesian logistic regression: ridge or horseshoe-like shrinkage, with per-row offsets |
+| `augur.hier` | Effects over a tree of units: nested random intercepts with variances by empirical Bayes, and dynamic AR(1) states per node for counts (bottom-up evidence, top-down scaling), each level's persistence and size chosen by one-step-ahead predictive likelihood; window multipliers and the chance of any event in a group under shared states |
 | `augur.pool` | Combining forecasters: EM linear pools, Hedge weights, the log-odds median, a log-linear stack |
 | `augur.score` | AUC, average precision, recall at a budget, Brier, usefulness, area skill, matched concordance, paired bootstrap gains (one- and two-way), a risk-adjusted CUSUM, out-of-sample stacks and drift refits, the PIT and CRPS of a sample |
 | `augur.ftest` | Tests of forecasts: out-of-sample R², Clark-West, Diebold-Mariano, Pesaran-Timmermann, QLIKE, CRPS and log scores, Kupiec, Christoffersen, Berkowitz, Newey-West, Hansen's SPA |

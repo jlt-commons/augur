@@ -1,8 +1,10 @@
 (ns augur.logit
   "Weighted Bayesian logistic regression: Gaussian priors centred on zero
   (ridge) on standardized inputs, or a horseshoe-like reweighting of them,
-  fit by damped Newton steps. Rows are {:x :y :w}: x the inputs (x[0] the
-  intercept's 1) as a double array or a vector, y a boolean, w a weight.
+  fit by damped Newton steps. Rows are {:x :y :w :o}: x the inputs (x[0]
+  the intercept's 1) as a double array or a vector, y a boolean, w a
+  weight, and o an optional offset, a fixed part of the log odds (another
+  model's contribution, say; 0 when absent).
 
   Fitting is for the end of a run or offline: it is O(rows x inputs^2) per
   step. `fit` returns a double array; `->state` makes it a vector of
@@ -49,10 +51,12 @@
         ^doubles z (double-array (* n k))
         ^doubles ys (double-array n)
         ^doubles ws (double-array n)
+        ^doubles os (double-array n)
         ^doubles mean (double-array k) ^doubles sd (double-array k 1.0)
         _ (dotimes [r n]
-            (let [{:keys [x y w]} (rows r) ^doubles x (->array x)]
+            (let [{:keys [x y w o]} (rows r) ^doubles x (->array x)]
               (System/arraycopy x 0 z (* r k) k)
+              (aset os r (double (or o 0.0)))
               (aset ys r (if y 1.0 0.0))
               (aset ws r (double w))))
         wsum (Math/max 1e-12 (loop [r 0 acc 0.0] (if (< r n) (recur (inc r) (+ acc (aget ws r))) acc)))
@@ -84,7 +88,7 @@
         _ (aset pen 0 1e-4)
         eta (fn ^double [^doubles bb ^long r]
               (let [o (* r k)]
-                (loop [i 0 acc 0.0] (if (< i k) (recur (inc i) (+ acc (* (aget bb i) (aget z (+ o i))))) acc))))
+                (loop [i 0 acc (aget os r)] (if (< i k) (recur (inc i) (+ acc (* (aget bb i) (aget z (+ o i))))) acc))))
         objective (fn ^double [^doubles bb]
                     (- (loop [r 0 acc 0.0]
                          (if (< r n)
@@ -167,7 +171,9 @@
 
 (defn predict
   "The probability for inputs x (x[0] the intercept's 1) under
-  coefficients beta: arrays, or vectors as `->state` gives."
-  ^double [beta x]
-  (let [^doubles beta (->array beta) ^doubles x (->array x)]
-    (m/expit (loop [i 0 acc 0.0] (if (< i (alength beta)) (recur (inc i) (+ acc (* (aget beta i) (aget x i)))) acc)))))
+  coefficients beta: arrays, or vectors as `->state` gives; `offset` is
+  added to the log odds."
+  (^double [beta x] (predict beta x 0.0))
+  (^double [beta x offset]
+   (let [^doubles beta (->array beta) ^doubles x (->array x)]
+     (m/expit (loop [i 0 acc (double offset)] (if (< i (alength beta)) (recur (inc i) (+ acc (* (aget beta i) (aget x i)))) acc))))))
