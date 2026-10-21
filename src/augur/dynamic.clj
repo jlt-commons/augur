@@ -143,6 +143,27 @@
      (predict-averaged state x offset)
      (predict-one state (pick state x) offset))))
 
+(declare predictive)
+
+(defn- predictive-averaged [{:keys [models w]} x offset]
+  (let [ms (for [[k mdl] models] [(w k) (predictive mdl x offset)])
+        f (reduce + (for [[wk {:keys [f]}] ms] (* wk f)))]
+    {:f f
+     ;; the mixture's variance: within the models plus between their means
+     :q (- (reduce + (for [[wk {f' :f q' :q}] ms] (* wk (+ q' (* f' f'))))) (* f f))}))
+
+(defn predictive
+  "The linear predictor's predictive moments for inputs x in the coming
+  period, {:f mean :q variance}, `offset` included in the mean; for a model
+  average, the mixture's mean and variance. What predict integrates over."
+  ([state x] (predictive state x 0.0))
+  ([state x offset]
+   (if (= :averaged (:type state))
+     (predictive-averaged state x offset)
+     (let [{:keys [m c k discount]} state
+           [f q] (moments m c k (pick state x) (double (or offset 0.0)) (/ 1.0 discount))]
+       {:f f :q q}))))
+
 (defn- poisson-log-predictive
   "log P(y) for a count whose log rate is N(f, q): the negative binomial
   with the lognormal rate's mean mu = exp(f + q/2) and variance mu + mu^2

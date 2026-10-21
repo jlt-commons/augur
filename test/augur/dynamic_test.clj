@@ -122,3 +122,19 @@
   (let [unsure (d/poisson {:mean [1.0] :var [2.0] :discount 1.0})
         sure (d/poisson {:mean [1.0] :var [0.0001] :discount 1.0})]
     (is (> (d/log-score unsure [{:x [1.0] :y 0}]) (d/log-score sure [{:x [1.0] :y 0}])))))
+
+(deftest the-linear-predictor-s-moments
+  (let [s (d/logistic {:mean [0.5 1.0] :var [0.2 0.3] :discount 1.0})
+        {:keys [f q]} (d/predictive s [1.0 2.0] 0.25)]
+    (is (< (Math/abs (- f 2.75)) 1e-12) "x'm plus the offset")
+    (is (< (Math/abs (- q (+ 0.2 (* 4 0.3)))) 1e-12) "x'Cx")
+    (testing "what predict integrates"
+      (is (< (Math/abs (- (d/predict s [1.0 2.0] 0.25) (m/expit (/ f (Math/sqrt (+ 1.0 (/ (* Math/PI q) 8.0))))))) 1e-12))))
+  (testing "a model average: the mixture's mean and variance"
+    (let [a (d/logistic {:mean [1.0] :var [0.1] :discount 1.0})
+          b (d/logistic {:mean [-1.0] :var [0.3] :discount 1.0})
+          avg (assoc (d/averaged {:a a :b b} {:forget 1.0}) :w {:a 0.25 :b 0.75})
+          {:keys [f q]} (d/predictive avg [1.0])]
+      (is (< (Math/abs (- f -0.5)) 1e-12))
+      ;; within, 0.25 0.1 + 0.75 0.3 = 0.25, plus between, 1 - 0.5^2 = 0.75
+      (is (< (Math/abs (- q 1.0)) 1e-9)))))
