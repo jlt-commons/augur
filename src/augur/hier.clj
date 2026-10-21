@@ -53,9 +53,13 @@
   tau2 set to the mean of its effects' squares and posterior variances
   (the Laplace EM step), unless :fixed. Options: :tau2, one starting
   variance per level, and :sweeps, both required; :start, effects to start
-  from. {:effects {id effect} :tau2 [...]}."
-  [rows {:keys [tau2 sweeps fixed start]}]
+  from; :sd-prior, one scale per level of a half-normal prior on the
+  level's sd (Gelman 2006), which makes the variance step a posterior mode
+  and keeps nodes whose rows all go one way from inflating it. {:effects {id effect} :tau2 [...]}."
+  [rows {:keys [tau2 sweeps fixed start sd-prior]}]
   (when-not (and tau2 sweeps) (throw (ex-info "augur.hier/intercepts needs :tau2 and :sweeps" {})))
+  (when (and sd-prior (not= (count sd-prior) (count tau2)))
+    (throw (ex-info "augur.hier/intercepts needs one :sd-prior scale per level" {:sd-prior sd-prior :tau2 tau2})))
   (let [rows (vec rows)
         n (count rows)
         L (count tau2)
@@ -128,8 +132,15 @@
                           (let [ids (keys (members l))]
                             (if (empty? ids)
                               (tau2 l)
-                              (max 1e-6 (/ (reduce + (map #(let [a (double (.get fx %))] (+ (* a a) (double (.get vars %)))) ids))
-                                           (count ids))))))))))))))
+                              (let [ss (reduce + (map #(let [a (double (.get fx %))] (+ (* a a) (double (.get vars %)))) ids))
+                                    m (double (count ids))]
+                                (max 1e-6
+                                     (if sd-prior
+                                       ;; the mode under a half-normal(0, s) prior on the sd:
+                                       ;; v^2 + m s^2 v - ss s^2 = 0, ss/m as s grows
+                                       (let [s2 (let [x (double (sd-prior l))] (* x x))]
+                                         (/ (* 2.0 ss s2) (+ (* m s2) (Math/sqrt (+ (* m m s2 s2) (* 4.0 ss s2))))))
+                                       (/ ss m)))))))))))))))
 
 ;; --- dynamic states --------------------------------------------------------
 

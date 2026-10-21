@@ -177,3 +177,63 @@
   (^double [beta x offset]
    (let [^doubles beta (->array beta) ^doubles x (->array x)]
      (m/expit (loop [i 0 acc (double offset)] (if (< i (alength beta)) (recur (inc i) (+ acc (* (aget beta i) (aget x i)))) acc))))))
+
+(defn- posterior-variances
+  "The standardized coefficients of `beta` and the diagonal of their
+  posterior covariance (the inverse of the penalized Hessian at beta), on
+  the scale `fit` standardizes to: [b v], each a double array of k."
+  [rows ^long k ^doubles beta ^double prior]
+  (let [rows (vec rows)
+        n (count rows)
+        xs (mapv #(->array (:x %)) rows)
+        ws (mapv #(double (:w %)) rows)
+        wsum (Math/max 1e-12 (double (reduce + ws)))
+        mean (double-array k) sd (double-array k 1.0)]
+    (dotimes [r n] (let [^doubles x (xs r) w (double (ws r))] (dotimes [j k] (aset mean j (+ (aget mean j) (* w (aget x j)))))))
+    (dotimes [j k] (aset mean j (/ (aget mean j) wsum)))
+    (let [v (double-array k)]
+      (dotimes [r n] (let [^doubles x (xs r) w (double (ws r))] (dotimes [j k] (let [d (- (aget x j) (aget mean j))] (aset v j (+ (aget v j) (* w d d)))))))
+      (dotimes [j k] (let [s (Math/sqrt (/ (aget v j) wsum))] (aset sd j (if (> s 1e-9) s 1.0)))))
+    (aset mean 0 0.0) (aset sd 0 1.0)
+    (let [h (double-array (* k k))
+          z (double-array k)]
+      (dotimes [r n]
+        (let [^doubles x (xs r)
+              e (loop [i 0 acc (double (or (:o (rows r)) 0.0))] (if (< i k) (recur (inc i) (+ acc (* (aget beta i) (aget x i)))) acc))
+              p (m/expit e)
+              s (* (double (ws r)) (Math/max 1e-9 (* p (- 1.0 p))))]
+          (aset z 0 1.0)
+          (loop [j 1] (when (< j k) (aset z j (/ (- (aget x j) (aget mean j)) (aget sd j))) (recur (inc j))))
+          (dotimes [i k] (dotimes [j k] (aset h (+ (* i k) j) (+ (aget h (+ (* i k) j)) (* s (aget z i) (aget z j))))))))
+      (aset h 0 (+ (aget h 0) 1e-4))
+      (loop [j 1] (when (< j k) (aset h (+ (* j k) j) (+ (aget h (+ (* j k) j)) prior)) (recur (inc j))))
+      (let [b (double-array k) v (double-array k)]
+        (dotimes [j k] (aset b j (* (aget beta j) (aget sd j))))
+        (dotimes [j k]
+          (let [e (double-array k)]
+            (aset e j 1.0)
+            (aset v j (aget ^doubles (m/solve-spd h e k) j))))
+        [b v]))))
+
+(defn fit-evidence
+  "`fit` with the prior precision estimated from the data rather than
+  given: the coefficients past the intercept are a Gaussian random effect,
+  and each of :rounds rounds fits at the current precision and sets it to
+  (k-1) / sum(b^2 + v), b the standardized coefficients and v their
+  posterior variances (the Laplace EM step; MacKay 1992, Wood 2011). This
+  is what lets the ridge be estimated beside random effects that compete
+  with it for the same signal. :prior is the starting precision; :rounds
+  is required. {:beta :prior}."
+  [rows ^long k {:keys [prior rounds start iterations]}]
+  (when-not (and prior rounds) (throw (ex-info "augur.logit/fit-evidence needs :prior and :rounds" {})))
+  (let [rows (vec rows)]
+    (loop [r 0 prior (double prior) beta start]
+      (let [beta (fit rows k (cond-> {:prior prior :start beta} iterations (assoc :iterations iterations)))]
+        (if (>= r rounds)
+          {:beta beta :prior prior}
+          (let [[^doubles b ^doubles v] (posterior-variances rows k beta prior)
+                ss (loop [j 1 acc 0.0] (if (< j k) (recur (inc j) (+ acc (* (aget b j) (aget b j)) (aget v j))) acc))
+                prior' (/ (double (dec k)) (Math/max 1e-12 ss))]
+            (if (< (Math/abs (- (Math/log prior') (Math/log prior))) 1e-4)
+              {:beta (fit rows k (cond-> {:prior prior' :start beta} iterations (assoc :iterations iterations))) :prior prior'}
+              (recur (inc r) prior' beta))))))))

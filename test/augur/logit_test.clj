@@ -84,3 +84,23 @@
       (is (< (Math/abs (- (logit/predict with [1.0 0.5] 1.5)
                           (m/expit (+ (aget with 0) (* 0.5 (aget with 1)) 1.5))))
              1e-12)))))
+
+(deftest the-prior-precision-can-be-estimated
+  ;; coefficients drawn with precision 4 on standardized inputs: the
+  ;; evidence (Laplace EM) step finds it from either side
+  (let [g (m/rng 11)
+        k 9
+        truth (double-array (cons -2.0 (repeatedly (dec k) #(* 0.5 (m/normal! g)))))
+        rows (vec (for [_ (range 6000)]
+                    (let [x (double-array (cons 1.0 (repeatedly (dec k) #(m/normal! g))))]
+                      {:x x :y (< (m/next-double! g) (logit/predict truth x)) :w 1.0})))
+        from-weak (logit/fit-evidence rows k {:prior 0.01 :rounds 30})
+        from-strong (logit/fit-evidence rows k {:prior 1000.0 :rounds 30})]
+    (is (< 1.0 (:prior from-weak) 16.0) (:prior from-weak))
+    (is (< (Math/abs (- (Math/log (:prior from-weak)) (Math/log (:prior from-strong)))) 0.05)
+        [(:prior from-weak) (:prior from-strong)])
+    (testing "the coefficients are the fit at the estimated prior"
+      (is (< (reduce max (map #(Math/abs (- %1 %2)) (:beta from-weak)
+                              (logit/fit rows k {:prior (:prior from-weak)})))
+             1e-3))))
+  (is (thrown? Exception (logit/fit-evidence [] 2 {:prior 1.0})) "needs :rounds"))

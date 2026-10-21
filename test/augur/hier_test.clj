@@ -154,3 +154,18 @@
                       {:path ["a" (str "l" l)] :o -3.35 :y (< i 4) :w (if (< i 4) 0.9 4.5)}))
           fit (h/intercepts rows {:tau2 [0.7 3.4] :sweeps 12})]
       (is (every? #(< % 100.0) (:tau2 fit)) (:tau2 fit)))))
+
+(deftest a-prior-on-the-spread-reins-in-separated-nodes
+  ;; leaves with all their rows one way pull their effects outward and the
+  ;; EM reads that as spread; a half-normal prior on each level's sd (Gelman
+  ;; 2006; Chung et al. 2013) shrinks it unless the data insist
+  (let [rows (vec (for [l (range 40) i (range 12)]
+                    {:path [(str "l" l)] :o -3.0 :y (and (< l 4) (< i 8)) :w 1.0}))
+        free (h/intercepts rows {:tau2 [1.0] :sweeps 40})
+        tight (h/intercepts rows {:tau2 [1.0] :sweeps 40 :sd-prior [0.5]})
+        loose (h/intercepts rows {:tau2 [1.0] :sweeps 40 :sd-prior [1e6]})]
+    (is (< (first (:tau2 tight)) (* 0.8 (first (:tau2 free)))) [(:tau2 tight) (:tau2 free)])
+    (testing "a very wide prior is no prior"
+      (is (< (Math/abs (- (first (:tau2 loose)) (first (:tau2 free)))) 1e-3) [(:tau2 loose) (:tau2 free)])))
+  (is (thrown? Exception (h/intercepts [{:path ["a"] :o 0.0 :y true :w 1.0}] {:tau2 [1.0 1.0] :sweeps 1 :sd-prior [1.0]}))
+      "one scale per level"))
