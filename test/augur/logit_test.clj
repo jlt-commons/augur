@@ -104,3 +104,14 @@
                               (logit/fit rows k {:prior (:prior from-weak)})))
              1e-3))))
   (is (thrown? Exception (logit/fit-evidence [] 2 {:prior 1.0})) "needs :rounds"))
+
+(deftest one-evidence-step
+  (let [g (m/rng 12)
+        rows (vec (for [_ (range 2000)]
+                    (let [x (double-array [1.0 (m/normal! g) (m/normal! g) (m/normal! g)])]
+                      {:x x :y (< (m/next-double! g) (logit/predict (double-array [-2.0 0.5 -0.3 0.0]) x)) :w 1.0 :o 0.1})))
+        beta (logit/fit rows 4 {:prior 10.0})
+        step (logit/evidence-step rows 4 beta 10.0)]
+    (is (= step (:prior (logit/fit-evidence rows 4 {:prior 10.0 :rounds 1})))
+        "fit-evidence's first round is a fit then this step")
+    (is (< 0.0 step 1e6))))

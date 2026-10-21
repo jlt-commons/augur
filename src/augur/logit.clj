@@ -204,7 +204,10 @@
               s (* (double (ws r)) (Math/max 1e-9 (* p (- 1.0 p))))]
           (aset z 0 1.0)
           (loop [j 1] (when (< j k) (aset z j (/ (- (aget x j) (aget mean j)) (aget sd j))) (recur (inc j))))
-          (dotimes [i k] (dotimes [j k] (aset h (+ (* i k) j) (+ (aget h (+ (* i k) j)) (* s (aget z i) (aget z j))))))))
+          ;; upper triangle only, mirrored below
+          (dotimes [i k] (let [si (* s (aget z i)) hi (* i k)]
+                           (loop [j i] (when (< j k) (aset h (+ hi j) (+ (aget h (+ hi j)) (* si (aget z j)))) (recur (inc j))))))))
+      (dotimes [i k] (loop [j (inc i)] (when (< j k) (aset h (+ (* j k) i) (aget h (+ (* i k) j))) (recur (inc j)))))
       (aset h 0 (+ (aget h 0) 1e-4))
       (loop [j 1] (when (< j k) (aset h (+ (* j k) j) (+ (aget h (+ (* j k) j)) prior)) (recur (inc j))))
       (let [b (double-array k) v (double-array k)]
@@ -215,12 +218,28 @@
             (aset v j (aget ^doubles (m/solve-spd h e k) j))))
         [b v]))))
 
+(defn evidence-step
+  "The ridge precision after one evidence step from coefficients `beta`
+  fit to `rows` at precision `prior`. MacKay's (1992) update gamma /
+  sum(b^2), gamma = (k-1) - prior * sum(v) the coefficients' effective
+  number, b the standardized coefficients past the intercept and v their
+  posterior variances: it has the fixed point of the Laplace EM step
+  (k-1) / sum(b^2 + v) and gets there in far fewer steps, and the EM
+  step is the fallback where it is undefined."
+  ^double [rows ^long k ^doubles beta ^double prior]
+  (let [[^doubles b ^doubles v] (posterior-variances rows k beta prior)
+        bb (loop [j 1 acc 0.0] (if (< j k) (recur (inc j) (+ acc (* (aget b j) (aget b j)))) acc))
+        vv (loop [j 1 acc 0.0] (if (< j k) (recur (inc j) (+ acc (aget v j))) acc))
+        gamma (- (double (dec k)) (* prior vv))]
+    (if (and (> gamma 0.0) (> bb 1e-12))
+      (/ gamma bb)
+      (/ (double (dec k)) (Math/max 1e-12 (+ bb vv))))))
+
 (defn fit-evidence
   "`fit` with the prior precision estimated from the data rather than
   given: the coefficients past the intercept are a Gaussian random effect,
-  and each of :rounds rounds fits at the current precision and sets it to
-  (k-1) / sum(b^2 + v), b the standardized coefficients and v their
-  posterior variances (the Laplace EM step; MacKay 1992, Wood 2011). This
+  and each of :rounds rounds fits at the current precision and takes an
+  `evidence-step` from it (MacKay 1992; Wood 2011). This
   is what lets the ridge be estimated beside random effects that compete
   with it for the same signal. :prior is the starting precision; :rounds
   is required. {:beta :prior}."
@@ -231,9 +250,7 @@
       (let [beta (fit rows k (cond-> {:prior prior :start beta} iterations (assoc :iterations iterations)))]
         (if (>= r rounds)
           {:beta beta :prior prior}
-          (let [[^doubles b ^doubles v] (posterior-variances rows k beta prior)
-                ss (loop [j 1 acc 0.0] (if (< j k) (recur (inc j) (+ acc (* (aget b j) (aget b j)) (aget v j))) acc))
-                prior' (/ (double (dec k)) (Math/max 1e-12 ss))]
+          (let [prior' (evidence-step rows k beta prior)]
             (if (< (Math/abs (- (Math/log prior') (Math/log prior))) 1e-4)
               {:beta (fit rows k (cond-> {:prior prior' :start beta} iterations (assoc :iterations iterations))) :prior prior'}
               (recur (inc r) prior' beta))))))))
