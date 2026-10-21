@@ -191,3 +191,26 @@
     (assoc avg
            :w (update-vals post #(/ % z))
            :models (update-vals models #(step % rows)))))
+
+(defn couple
+  "Two models of one layout learning from each other's experience: each
+  coefficient at `:indices` moves toward the other's by w = s p' / (p + s
+  p'), p and p' the two precisions and s the :strength (0 none, 1 as if
+  the other's belief were one more of one's own). Only the means move:
+  repeated coupling must not count the same evidence twice, so the
+  variances stay. [a' b'], each moved by the other's belief before the
+  coupling."
+  [a b {:keys [indices strength]}]
+  (need :couple {:indices indices :strength strength})
+  (let [k (:k a)
+        ma (aclone ^doubles (:m a)) mb (aclone ^doubles (:m b))
+        ^doubles ca (:c a) ^doubles cb (:c b)
+        s (double strength)]
+    (doseq [i indices]
+      (let [i (long i)
+            pa (/ 1.0 (Math/max 1e-12 (aget ca (+ (* i k) i))))
+            pb (/ 1.0 (Math/max 1e-12 (aget cb (+ (* i k) i))))
+            a0 (aget ^doubles (:m a) i) b0 (aget ^doubles (:m b) i)]
+        (aset ma i (+ a0 (* (/ (* s pb) (+ pa (* s pb))) (- b0 a0))))
+        (aset mb i (+ b0 (* (/ (* s pa) (+ pb (* s pa))) (- a0 b0))))))
+    [(assoc a :m ma) (assoc b :m mb)]))

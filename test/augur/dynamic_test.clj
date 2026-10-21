@@ -85,3 +85,20 @@
 (deftest options-are-required
   (is (thrown? Exception (d/logistic {:mean [0] :var [1]})) "needs :discount")
   (is (thrown? Exception (d/logistic {:mean [0 0] :var [1] :discount 1.0})) "one variance per mean"))
+
+(deftest coupling-pulls-means-by-certainty
+  (let [a (d/logistic {:mean [0.0 0.0] :var [1.0 1.0] :discount 1.0})
+        sure (d/logistic {:mean [5.0 2.0] :var [1.0 0.01] :discount 1.0})
+        unsure (d/logistic {:mean [5.0 2.0] :var [1.0 100.0] :discount 1.0})
+        [a1 _] (d/couple a sure {:indices [1] :strength 0.5})
+        [a2 _] (d/couple a unsure {:indices [1] :strength 0.5})]
+    (is (= 0.0 (first (d/means a1))) "an index not listed stays")
+    (is (> (second (d/means a1)) 1.5) "toward a confident partner, far")
+    (is (< (second (d/means a2)) 0.1) "toward an unsure one, little")
+    (is (= (vec (:c a)) (vec (:c a1))) "variances stay: no evidence counted twice"))
+  (testing "both ways at once"
+    (let [a (d/logistic {:mean [0.0 0.0] :var [1.0 1.0] :discount 1.0})
+          b (d/logistic {:mean [0.0 2.0] :var [1.0 1.0] :discount 1.0})
+          [a' b'] (d/couple a b {:indices [1] :strength 1.0})]
+      (is (< (Math/abs (- (second (d/means a')) 1.0)) 1e-12))
+      (is (< (Math/abs (- (second (d/means b')) 1.0)) 1e-12)))))
