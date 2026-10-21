@@ -42,6 +42,9 @@
   (let [fx (:effects fit)]
     (reduce + 0.0 (map #(double (get fx % 0.0)) path))))
 
+(defn- softplus ^double [^double e]
+  (if (> e 0.0) (+ e (Math/log1p (Math/exp (- e)))) (Math/log1p (Math/exp e))))
+
 (defn intercepts
   "Nested random intercepts for logistic rows {:path :o :y :w}: o a fixed
   offset (the rest of the model's log odds), path the row's nodes from the
@@ -81,21 +84,43 @@
           (doseq [l (range L) [id ^ints rs] (members l)]
             (let [prec (/ 1.0 (double (tau2 l)))
                   a0 (double (.get fx id))]
-              (loop [i 0 a a0]
-                (let [[g h] (loop [j 0 g (- (* prec a)) h prec]
-                              (if (< j (alength rs))
-                                (let [r (aget rs j)
-                                      p (m/expit (+ (aget lin r) (- a a0)))
-                                      w (aget ws r)]
-                                  (recur (inc j) (+ g (* w (- (aget ys r) p))) (+ h (* w p (- 1.0 p)))))
-                                [g h]))
-                      a' (+ a (/ (double g) (double h)))]
-                  (if (and (< i 5) (> (Math/abs (- a' a)) 1e-9))
-                    (recur (inc i) a')
-                    (do (.put fx id a')
-                        (.put vars id (/ 1.0 (double h)))
-                        (let [d (- a' a0)]
-                          (dotimes [j (alength rs)] (let [r (aget rs j)] (aset lin r (+ (aget lin r) d)))))))))))
+              ;; damped Newton: each step halved until the node's penalized
+              ;; log likelihood improves (a node with few rows has little
+              ;; curvature, where full steps overshoot and oscillate)
+              (let [objective (fn ^double [^double a]
+                                (loop [j 0 acc (* -0.5 prec a a)]
+                                  (if (< j (alength rs))
+                                    (let [r (aget rs j)
+                                          e (+ (aget lin r) (- a a0))]
+                                      (recur (inc j) (+ acc (* (aget ws r) (- (* (aget ys r) e) (softplus e))))))
+                                    acc)))]
+                (loop [i 0 a a0 obj (objective a0)]
+                  (let [[g h] (loop [j 0 g (- (* prec a)) h prec]
+                                (if (< j (alength rs))
+                                  (let [r (aget rs j)
+                                        p (m/expit (+ (aget lin r) (- a a0)))
+                                        w (aget ws r)]
+                                    (recur (inc j) (+ g (* w (- (aget ys r) p))) (+ h (* w p (- 1.0 p)))))
+                                  [g h]))
+                        step (/ (double g) (double h))
+                        ;; no worse than rounding: near the mode a full step's
+                        ;; gain is below the sum's precision
+                        tol (* 1e-12 (+ 1.0 (Math/abs obj)))
+                        [a' obj'] (loop [t 1.0 tries 0]
+                                    (let [c (+ a (* t step)) o (objective c)]
+                                      (if (or (>= o (- obj tol)) (>= tries 30)) [c o] (recur (* 0.5 t) (inc tries)))))
+                        [a' obj'] (if (>= obj' (- obj tol)) [a' obj'] [a obj])]
+                    (if (and (< i 50) (> (Math/abs (- (double a') a)) 1e-9))
+                      (recur (inc i) a' obj')
+                      (let [h (loop [j 0 h prec]
+                                (if (< j (alength rs))
+                                  (let [r (aget rs j) p (m/expit (+ (aget lin r) (- (double a') a0)))]
+                                    (recur (inc j) (+ h (* (aget ws r) p (- 1.0 p)))))
+                                  h))]
+                        (.put fx id a')
+                        (.put vars id (/ 1.0 h))
+                        (let [d (- (double a') a0)]
+                          (dotimes [j (alength rs)] (let [r (aget rs j)] (aset lin r (+ (aget lin r) d))))))))))))
           (recur (inc sweep)
                  (if fixed
                    tau2

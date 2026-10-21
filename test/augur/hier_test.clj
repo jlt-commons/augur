@@ -135,3 +135,22 @@
     (is (>= (:score far) (:score near-at-8)))
     (testing "the horizon changes what is scored"
       (is (not= (:ll near) (:ll near-at-8))))))
+
+(deftest nested-intercepts-reach-the-mode-with-few-rows
+  ;; a leaf with a few rows and a loose prior has little curvature, where
+  ;; an undamped Newton step overshoots and oscillates
+  (let [rows (vec (concat (for [w [4.0 4.4 5.6]] {:path ["few"] :o -3.77 :y false :w w})
+                          (repeat 4 {:path ["few"] :o -3.77 :y true :w 0.9})))
+        fit (h/intercepts rows {:tau2 [3.4] :sweeps 2 :fixed true :start {"few" -0.65}})
+        a (get (:effects fit) "few")
+        grad (+ (- (/ a 3.4))
+                (reduce + (for [{:keys [o y w]} rows
+                                :let [p (m/expit (+ o a))]]
+                            (* w (- (if y 1.0 0.0) p)))))]
+    (testing "the leaf sits at its mode"
+      (is (< (Math/abs (double grad)) 1e-4) (:effects fit))))
+  (testing "the variances stay finite when estimated"
+    (let [rows (vec (for [l (range 30) i (range 7)]
+                      {:path ["a" (str "l" l)] :o -3.35 :y (< i 4) :w (if (< i 4) 0.9 4.5)}))
+          fit (h/intercepts rows {:tau2 [0.7 3.4] :sweeps 12})]
+      (is (every? #(< % 100.0) (:tau2 fit)) (:tau2 fit)))))
