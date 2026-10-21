@@ -102,3 +102,23 @@
           [a' b'] (d/couple a b {:indices [1] :strength 1.0})]
       (is (< (Math/abs (- (second (d/means a')) 1.0)) 1e-12))
       (is (< (Math/abs (- (second (d/means b')) 1.0)) 1e-12)))))
+
+(deftest no-weight-dies
+  ;; a weight that underflows to zero could never come back
+  (let [avg (d/averaged {:a (d/poisson {:mean [0.0] :var [400.0] :discount 1.0})
+                         :b (d/poisson {:mean [0.0] :var [1.0] :discount 1.0})}
+                        {:forget 0.99})
+        after (d/step avg [{:x [1.0] :y 50}])]
+    (is (every? pos? (vals (d/weights after))) (d/weights after))))
+
+(deftest numeric-outcomes
+  (let [s (reduce d/step (d/logistic {:mean [0.0] :var [4.0] :discount 1.0}) (repeat 20 [{:x [1.0] :y 0}]))]
+    (is (< (d/predict s [1.0]) 0.2) "0 is no event, as false is")))
+
+(deftest poisson-evidence-integrates-uncertainty
+  ;; an unsure model's predictive spreads its mass: integrated over its
+  ;; uncertainty, a zero count is likelier than a Poisson at its inflated
+  ;; mean would say, and likelier than the sure model says
+  (let [unsure (d/poisson {:mean [1.0] :var [2.0] :discount 1.0})
+        sure (d/poisson {:mean [1.0] :var [0.0001] :discount 1.0})]
+    (is (> (d/log-score unsure [{:x [1.0] :y 0}]) (d/log-score sure [{:x [1.0] :y 0}])))))

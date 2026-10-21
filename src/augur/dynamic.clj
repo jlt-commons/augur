@@ -22,7 +22,8 @@
   inputs can be averaged on the same rows.
 
   Rows are {:x :y}, with an optional weight :w and offset :o (a fixed part
-  of the linear predictor: another model's log odds, an exposure's log).
+  of the linear predictor: another model's log odds, an exposure's log). A
+  binary :y is true or a positive number; false, nil and 0 are no event.
 
   `averaged` combines models: each period their weights are flattened by
   :forget (weights to the power forget, renormalized), so a model's past
@@ -87,16 +88,21 @@
       ;; the mean of a lognormal rate
       :poisson (Math/exp (+ f (* 0.5 q))))))
 
+(defn- event?
+  "A binary outcome: true, or a positive number (0 and false are none)."
+  [y]
+  (if (number? y) (pos? (double y)) (boolean y)))
+
 (defn- loglik ^double [type ^double eta y ^double w]
   (case type
-    :logistic (* w (- (* (if y 1.0 0.0) eta) (if (> eta 0.0) (+ eta (Math/log1p (Math/exp (- eta)))) (Math/log1p (Math/exp eta)))))
+    :logistic (* w (- (* (if (event? y) 1.0 0.0) eta) (if (> eta 0.0) (+ eta (Math/log1p (Math/exp (- eta)))) (Math/log1p (Math/exp eta)))))
     :poisson (* w (- (* (double y) eta) (Math/exp eta)))))
 
 (defn- grad-curv
   "The row's likelihood gradient and curvature in eta."
   [type ^double eta y ^double w]
   (case type
-    :logistic (let [p (m/expit eta)] [(* w (- (if y 1.0 0.0) p)) (* w p (- 1.0 p))])
+    :logistic (let [p (m/expit eta)] [(* w (- (if (event? y) 1.0 0.0) p)) (* w p (- 1.0 p))])
     :poisson (let [mu (Math/exp eta)] [(* w (- (double y) mu)) (* w mu)])))
 
 (defn- update-row!
@@ -137,17 +143,44 @@
      (predict-averaged state x offset)
      (predict-one state (pick state x) offset))))
 
+(defn- poisson-log-predictive
+  "log P(y) for a count whose log rate is N(f, q): the negative binomial
+  with the lognormal rate's mean mu = exp(f + q/2) and variance mu + mu^2
+  (e^q - 1), moment matched, whose size is then r = 1 / (e^q - 1) whatever
+  mu is; the Poisson when r is huge (q negligible). Computed in logs, so
+  a wildly uncertain model scores low, not NaN."
+  ^double [^double f ^double q ^double y]
+  (let [log-mu (Math/min 700.0 (+ f (* 0.5 q)))
+        r (/ 1.0 (Math/max 1e-300 (Math/expm1 (Math/min 700.0 q))))]
+    (if (> r 1e8)
+      (- (* y log-mu) (Math/exp log-mu) (m/log-gamma (+ 1.0 y)))
+      ;; log(r + mu), stably
+      (let [log-r (Math/log r)
+            log-sum (if (> log-mu log-r)
+                      (+ log-mu (Math/log1p (Math/exp (- log-r log-mu))))
+                      (+ log-r (Math/log1p (Math/exp (- log-mu log-r)))))]
+        (+ (m/log-gamma (+ y r)) (- (m/log-gamma r)) (- (m/log-gamma (+ 1.0 y)))
+           (* r (- log-r log-sum)) (* y (- log-mu log-sum)))))))
+
 (defn log-score
   "The log predictive probability of `rows` under the state before it
-  learns from them (a period's evidence for the state)."
+  learns from them (a period's evidence for the state), the coefficients'
+  uncertainty integrated over."
   [state rows]
   (reduce + (for [{:keys [x y w o]} rows
-                  :let [p (predict state x (or o 0.0))
-                        w (double (or w 1.0))]]
-              (case (if (= :averaged (:type state)) (:kind state) (:type state))
-                :logistic (* w (Math/log (Math/max 1e-300 (if y p (- 1.0 p)))))
-                ;; the Poisson probability at the predicted mean
-                :poisson (* w (- (* (double y) (Math/log (Math/max 1e-300 p))) p (m/log-gamma (+ 1.0 (double y)))))))))
+                  :let [w (double (or w 1.0))
+                        o (double (or o 0.0))]]
+              (if (= :averaged (:type state))
+                (let [p (predict state x o)]
+                  (case (:kind state)
+                    :logistic (* w (Math/log (Math/max 1e-300 (if (event? y) p (- 1.0 p)))))
+                    ;; the mixture's mean only: a period's evidence is scored per model
+                    :poisson (* w (- (* (double y) (Math/log (Math/max 1e-300 p))) p (m/log-gamma (+ 1.0 (double y)))))))
+                (case (:type state)
+                  :logistic (let [p (predict state x o)]
+                              (* w (Math/log (Math/max 1e-300 (if (event? y) p (- 1.0 p))))))
+                  :poisson (let [[f q] (moments (:m state) (:c state) (:k state) (pick state x) o (/ 1.0 (:discount state)))]
+                             (* w (poisson-log-predictive f q (double y)))))))))
 
 (defn step
   "The state after a period: discounted, then updated with each of `rows`."
@@ -187,7 +220,13 @@
         ll (into {} (for [[k mdl] models] [k (log-score mdl rows)]))
         top (apply max (vals ll))
         post (into {} (for [[k p] prior] [k (* p (Math/exp (- (ll k) top)))]))
-        z (reduce + (vals post))]
+        z (reduce + (vals post))
+        ;; a small share spread evenly, so no weight underflows to zero and
+        ;; stays there (0 to any power is 0): a model can always come back
+        eps 1e-6
+        n (count post)
+        post (update-vals post #(+ (* (- 1.0 eps) (/ % z)) (/ eps n)))
+        z 1.0]
     (assoc avg
            :w (update-vals post #(/ % z))
            :models (update-vals models #(step % rows)))))
