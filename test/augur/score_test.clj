@@ -284,3 +284,16 @@
   (is (thrown? Exception (score/paired-gain [[0 0.1 0.2 true]] (constantly 0.0) {:reps 10 :seed 1})))
   (is (thrown? Exception (score/cusum [0.1] [true] 2.0))))
 
+
+(deftest non-finite-scores-throw
+  ;; NaN equals nothing, so a tie scan on it never advanced: auc hung
+  (let [ps [0.1 ##NaN 0.3 0.2] ys [true false false true]
+        rows (map vector [1 1 2 2] ps ys)
+        calls {:auc #(score/auc ps ys)
+               :avg-precision #(score/avg-precision ps ys)
+               :recall-parts #(score/recall-parts rows 0.5)
+               :alarm-shares #(score/alarm-shares rows 0.5)
+               :usefulness #(score/usefulness ps ys 0.9)}]
+    (doseq [[k f] calls]
+      (let [r (deref (future (try (f) :no-error (catch Exception e (ex-message e)))) 10000 :hung)]
+        (is (and (string? r) (re-find #"non-finite" r)) (str k " " r))))))

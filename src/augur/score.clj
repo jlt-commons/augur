@@ -24,10 +24,21 @@
   (when-let [missing (seq (keep (fn [[k v]] (when (nil? v) k)) opts))]
     (throw (ex-info (str "augur.score/" (name f) " needs " (vec missing)) {:missing (vec missing)}))))
 
+(defn- finite!
+  "Throws naming `f` if any score is NaN or infinite: the rankings below
+  sort and tie on scores, and NaN ties with nothing (auc never got past
+  one)."
+  [f scores]
+  (doseq [x scores]
+    (let [x (double x)]
+      (when (or (Double/isNaN x) (Double/isInfinite x))
+        (throw (ex-info (str "augur.score/" (name f) ": non-finite score " x) {:score x}))))))
+
 (defn auc
   "Area under the ROC curve (Mann-Whitney, ties averaged), or nil without
   both outcomes."
   [scores labels]
+  (finite! :auc scores)
   (let [pairs (vec (sort-by first (map vector scores labels)))
         n (count pairs)
         n-pos (count (filter second pairs))
@@ -59,6 +70,7 @@
 (defn avg-precision
   "Area under the precision-recall curve, or nil without positives."
   [scores labels]
+  (finite! :avg-precision scores)
   (let [n-pos (count (filter true? labels))]
     (when (pos? n-pos)
       (loop [xs (sort-by (comp - first) (map vector scores labels)) i 1 hits 0 acc 0.0]
@@ -73,6 +85,7 @@
   rows ([period score label]) by score; rows tied at the cutoff share the
   slots left, so the order they come in does not matter."
   [rows budget]
+  (finite! :recall-parts (map second rows))
   (into {} (for [[q g] (group-by first rows)
                  :let [k (long (Math/ceil (* budget (count g))))]]
              [q [(loop [[[_ tied] & more] (sort-by #(- (double (key %))) (group-by #(double (second %)) g))
@@ -90,6 +103,8 @@
   and for rows tied at it the slots left over their number, as in
   `recall-parts`."
   [rows budget]
+  (finite! :recall-parts (map second rows))
+  (finite! :alarm-shares (map second rows))
   (let [rows (vec rows)
         out (double-array (count rows))]
     (doseq [[_ idx] (group-by #(first (rows %)) (range (count rows)))
@@ -186,6 +201,7 @@
   perfect forecast, 0 one worth nothing. Every threshold is tried in one
   sweep down the sorted forecasts."
   [ps ys mu]
+  (finite! :usefulness ps)
   (let [n (count ys)
         pos (count (filter true? ys))
         neg (- n pos)
