@@ -562,24 +562,31 @@
                        (dotimes [r n] (let [c (aget ci r) wr (aget w r)]
                                         (aset s c (+ (aget s c) (* wr (aget d r))))
                                         (aset t c (+ (aget t c) wr))))
-                       (double-array (for [c (range nc)] (if (pos? (aget t c)) (/ (aget s c) (aget t c)) 0.0)))))
+                       ;; a cell the draw missed has no mean in it (NaN), and
+                       ;; is left out of that draw rather than counted as zero
+                       (double-array (for [c (range nc)] (if (pos? (aget t c)) (/ (aget s c) (aget t c)) ##NaN)))))
         ^doubles diff (cell-means (double-array n 1.0))
         weights (two-way-weights rows (long per-block) 4)
         g (m/rng seed)
         boots (vec (repeatedly reps #(cell-means (weights g))))
+        drawn (fn [xs] (remove #(Double/isNaN (double %)) xs))
         se (double-array (for [c (range nc)]
-                           (let [xs (map #(aget ^doubles % c) boots)
-                                 mu (/ (reduce + xs) reps)]
-                             (Math/max 1e-12 (Math/sqrt (/ (reduce + (map #(* (- % mu) (- % mu)) xs)) (dec reps)))))))
+                           (let [xs (drawn (map #(aget ^doubles % c) boots))
+                                 k (count xs)]
+                             (if (< k 2)
+                               1e-12
+                               (let [mu (/ (reduce + xs) k)]
+                                 (Math/max 1e-12 (Math/sqrt (/ (reduce + (map #(* (- % mu) (- % mu)) xs)) (dec k)))))))))
         t (double-array (for [c (range nc)] (/ (aget diff c) (aget se c))))
         ;; centred bootstrap t's: the null distribution of each cell's t
         tstar (vec (for [^doubles b boots] (double-array (for [c (range nc)] (/ (- (aget b c) (aget diff c)) (aget se c))))))
-        p (fn [c] (/ (count (filter #(>= (aget ^doubles % c) (aget t c)) tstar)) (double reps)))
+        p (fn [c] (let [ts (drawn (map #(aget ^doubles % c) tstar))]
+                    (if (seq ts) (/ (count (filter #(>= % (aget t c)) ts)) (double (count ts))) 1.0)))
         order (sort-by #(- (aget t %)) (range nc))
         p-adj (loop [[c & more :as left] order prev 0.0 acc {}]
                 (if-not c
                   acc
-                  (let [mx (map (fn [^doubles ts] (reduce max (map #(aget ts %) left))) tstar)
+                  (let [mx (map (fn [^doubles ts] (reduce max ##-Inf (drawn (map #(aget ts %) left)))) tstar)
                         pa (Math/max prev (/ (count (filter #(>= % (aget t c)) mx)) (double reps)))]
                     (recur more pa (assoc acc c pa)))))]
     (into {} (for [c (range nc)]

@@ -336,3 +336,14 @@
     (is (not-any? #(:reject (cells %)) ["null1" "null2" "null3"]) cells)
     (testing "adjusted p-values never below the unadjusted"
       (is (every? #(>= (:p-adj %) (:p %)) (vals cells))))))
+
+(deftest romano-wolf-skips-a-cell-a-draw-missed
+  ;; a cell with one unit is missed by about a third of the draws; counted
+  ;; as a mean of zero there, its centred t is large when its difference is
+  ;; negative, and the max-T would mask a real cell
+  (let [real (sim-rows 6 0.9 ["real"])
+        tiny (for [q (range 40)] [q 0.9 0.1 false "lonely" "tiny"])
+        cells (score/romano-wolf (concat real tiny) brier {:reps 300 :seed 3 :alpha 0.05 :per-block 4 :cell #(nth % 5)})]
+    (is (:reject (cells "real")) (cells "real"))
+    (is (not (:reject (cells "tiny"))))
+    (is (< (:se (cells "tiny")) 1e-6) "every row the same difference: no spread when drawn, and no draw counted when missed")))
