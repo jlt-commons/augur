@@ -483,3 +483,105 @@
         n (count bounds)]
     (for [j (range 1 (inc bins))]
       (/ (reduce + (map #(- (cdf % (/ j (double bins))) (cdf % (/ (dec j) (double bins)))) bounds)) n))))
+
+(defn- two-way-weights
+  "A function of a generator giving, per row, how often its unit and its
+  block of periods were drawn (the pigeonhole bootstrap, Owen 2007): a
+  double array over `rows` ([period ... unit] with the unit at `unit-at`)."
+  [rows per-block unit-at]
+  (let [units (vec (distinct (map #(nth % unit-at) rows)))
+        blocks (vec (distinct (map #(quot (long (first %)) per-block) rows)))
+        ui (let [ix (zipmap units (range))] (int-array (map #(ix (nth % unit-at)) rows)))
+        bi (let [ix (zipmap blocks (range))] (int-array (map #(ix (quot (long (first %)) per-block)) rows)))
+        nu (count units) nb (count blocks) n (count rows)]
+    (fn [g]
+      (let [wu (double-array nu) wb (double-array nb) w (double-array n)]
+        (dotimes [_ nu] (let [i (min (dec nu) (long (* nu (m/next-double! g))))] (aset wu i (inc (aget wu i)))))
+        (dotimes [_ nb] (let [i (min (dec nb) (long (* nb (m/next-double! g))))] (aset wb i (inc (aget wb i)))))
+        (dotimes [r n] (aset w r (* (aget wu (aget ui r)) (aget wb (aget bi r)))))
+        w))))
+
+(defn- group-mean-diff
+  "The mean over groups of each group's weighted mean of `d`, rows indexed
+  by group `gi`; groups that drew no weight are left out."
+  ^double [^doubles d ^doubles w ^ints gi ^long ng]
+  (let [s (double-array ng) t (double-array ng)]
+    (dotimes [r (alength d)]
+      (let [g (aget gi r) wr (aget w r)]
+        (aset s g (+ (aget s g) (* wr (aget d r))))
+        (aset t g (+ (aget t g) wr))))
+    (loop [g 0 acc 0.0 k 0]
+      (if (< g ng)
+        (if (pos? (aget t g)) (recur (inc g) (+ acc (/ (aget s g) (aget t g))) (inc k)) (recur (inc g) acc k))
+        (if (pos? k) (/ acc k) 0.0)))))
+
+(defn paired-loss-2way
+  "How much lower a model's mean loss is than a benchmark's on the same rows
+  [period p-model p-bench outcome unit group] (group optional): `loss` a
+  function of a probability and an outcome, lower better (Brier, or the
+  log score with a floor). Every row counts, not only those near an alert
+  threshold, so it has far more power than a recall gain (Diebold &
+  Mariano 1995; Pepe et al. 2013). Groups weigh equally: the statistic is
+  the mean over groups of each group's mean difference. The interval
+  resamples units and blocks of :per-block periods both (the pigeonhole
+  bootstrap), :reps times from :seed, at 1 - :alpha.
+  {:diff :lo :hi :draws}, diff > 0 when the model's loss is lower."
+  [rows loss {:keys [reps seed alpha per-block]}]
+  (need :paired-loss-2way {:reps reps :seed seed :alpha alpha :per-block per-block})
+  (let [rows (vec rows)
+        n (count rows)
+        d (double-array (map (fn [[_ pm pb y]] (- (double (loss pb y)) (double (loss pm y)))) rows))
+        groups (vec (distinct (map #(nth % 5 nil) rows)))
+        gi (let [ix (zipmap groups (range))] (int-array (map #(ix (nth % 5 nil)) rows)))
+        ng (count groups)
+        ones (double-array n 1.0)
+        weights (two-way-weights rows (long per-block) 4)
+        g (m/rng seed)
+        draws (vec (sort (repeatedly reps #(group-mean-diff d (weights g) gi ng))))
+        at (fn [q] (nth draws (min (dec reps) (long (* q reps)))))]
+    {:diff (group-mean-diff d ones gi ng) :lo (at (/ alpha 2.0)) :hi (at (- 1.0 (/ alpha 2.0))) :draws draws}))
+
+(defn romano-wolf
+  "Which cells' models beat their benchmarks, controlling the chance of any
+  false claim across all of them (the stepdown max-T bootstrap of Romano &
+  Wolf 2005, Econometrica): tighter than Bonferroni when cells are
+  correlated, as cells sharing units and years are. Rows as
+  `paired-loss-2way`, :cell a function of a row naming its cell; one draw
+  of units and blocks serves every cell. Tests are one-sided (the model's
+  loss lower). {cell {:diff :se :t :p :p-adj :reject}}."
+  [rows loss {:keys [reps seed alpha per-block cell]}]
+  (need :romano-wolf {:reps reps :seed seed :alpha alpha :per-block per-block :cell cell})
+  (let [rows (vec rows)
+        n (count rows)
+        d (double-array (map (fn [[_ pm pb y]] (- (double (loss pb y)) (double (loss pm y)))) rows))
+        cells (vec (distinct (map cell rows)))
+        ci (let [ix (zipmap cells (range))] (int-array (map #(ix (cell %)) rows)))
+        nc (count cells)
+        cell-means (fn [^doubles w]
+                     (let [s (double-array nc) t (double-array nc)]
+                       (dotimes [r n] (let [c (aget ci r) wr (aget w r)]
+                                        (aset s c (+ (aget s c) (* wr (aget d r))))
+                                        (aset t c (+ (aget t c) wr))))
+                       (double-array (for [c (range nc)] (if (pos? (aget t c)) (/ (aget s c) (aget t c)) 0.0)))))
+        ^doubles diff (cell-means (double-array n 1.0))
+        weights (two-way-weights rows (long per-block) 4)
+        g (m/rng seed)
+        boots (vec (repeatedly reps #(cell-means (weights g))))
+        se (double-array (for [c (range nc)]
+                           (let [xs (map #(aget ^doubles % c) boots)
+                                 mu (/ (reduce + xs) reps)]
+                             (Math/max 1e-12 (Math/sqrt (/ (reduce + (map #(* (- % mu) (- % mu)) xs)) (dec reps)))))))
+        t (double-array (for [c (range nc)] (/ (aget diff c) (aget se c))))
+        ;; centred bootstrap t's: the null distribution of each cell's t
+        tstar (vec (for [^doubles b boots] (double-array (for [c (range nc)] (/ (- (aget b c) (aget diff c)) (aget se c))))))
+        p (fn [c] (/ (count (filter #(>= (aget ^doubles % c) (aget t c)) tstar)) (double reps)))
+        order (sort-by #(- (aget t %)) (range nc))
+        p-adj (loop [[c & more :as left] order prev 0.0 acc {}]
+                (if-not c
+                  acc
+                  (let [mx (map (fn [^doubles ts] (reduce max (map #(aget ts %) left))) tstar)
+                        pa (Math/max prev (/ (count (filter #(>= % (aget t c)) mx)) (double reps)))]
+                    (recur more pa (assoc acc c pa)))))]
+    (into {} (for [c (range nc)]
+               [(cells c) {:diff (aget diff c) :se (aget se c) :t (aget t c) :p (p c)
+                           :p-adj (p-adj c) :reject (< (p-adj c) alpha)}]))))

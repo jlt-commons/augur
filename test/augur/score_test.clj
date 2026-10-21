@@ -297,3 +297,42 @@
     (doseq [[k f] calls]
       (let [r (deref (future (try (f) :no-error (catch Exception e (ex-message e)))) 10000 :hung)]
         (is (and (string? r) (re-find #"non-finite" r)) (str k " " r))))))
+
+(def ^:private brier (fn [p y] (let [d (- p (if y 1.0 0.0))] (* d d))))
+
+(defn- sim-rows
+  "Rows [period p-model p-bench outcome unit group]: outcomes drawn from the
+  model's probabilities, so the model is right and the bench, which lacks
+  the signal z, is not; `beta` scales the signal."
+  [seed beta groups]
+  (let [g (m/rng seed)]
+    (vec (for [grp groups unit (range 60) q (range 40)
+               :let [z (m/normal! g)
+                     lb -3.0
+                     pm (m/expit (+ lb (* beta z)))
+                     pb (m/expit lb)]]
+           [q pm pb (< (m/next-double! g) pm) (str "u" unit) grp]))))
+
+(deftest paired-loss-finds-a-real-gain-and-no-false-one
+  (let [opts {:reps 300 :seed 2 :alpha 0.1 :per-block 4}
+        real (score/paired-loss-2way (sim-rows 3 0.8 ["a" "b"]) brier opts)
+        none (score/paired-loss-2way (sim-rows 3 0.0 ["a" "b"]) brier opts)]
+    (is (pos? (:diff real)) "positive: the model's loss is lower")
+    (is (pos? (:lo real)) real)
+    (is (<= (:lo none) 0.0 (:hi none)) none)
+    (testing "groups weigh equally: the mean of each group's mean"
+      (let [rows (concat (map #(assoc % 5 "big") (sim-rows 4 0.8 ["x"]))
+                         (take 200 (map #(assoc % 5 "small") (sim-rows 5 0.0 ["y"]))))
+            r (score/paired-loss-2way rows brier opts)
+            by (fn [grp] (:diff (score/paired-loss-2way (filter #(= grp (nth % 5)) rows) brier opts)))]
+        (is (< (Math/abs (- (:diff r) (/ (+ (by "big") (by "small")) 2.0))) 1e-12))))
+    (is (= (count (:draws real)) 300))))
+
+(deftest romano-wolf-controls-the-family-and-finds-real-cells
+  (let [rows (concat (sim-rows 6 0.9 ["real"]) (sim-rows 7 0.0 ["null1" "null2" "null3"]))
+        cells (score/romano-wolf rows brier {:reps 300 :seed 3 :alpha 0.05 :per-block 4 :cell #(nth % 5)})]
+    (is (= #{"real" "null1" "null2" "null3"} (set (keys cells))))
+    (is (:reject (cells "real")) (cells "real"))
+    (is (not-any? #(:reject (cells %)) ["null1" "null2" "null3"]) cells)
+    (testing "adjusted p-values never below the unadjusted"
+      (is (every? #(>= (:p-adj %) (:p %)) (vals cells))))))
