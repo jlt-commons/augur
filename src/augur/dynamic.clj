@@ -223,7 +223,9 @@
 (defn log-score
   "The log predictive probability of `rows` under the state before it
   learns from them (a period's evidence for the state), the coefficients'
-  uncertainty integrated over."
+  uncertainty integrated over; the rows scored independently against that
+  state. (An average weighs its linear models on their sequential
+  evidence, each row given the ones before it.)"
   [state rows]
   (reduce + (for [{:keys [x y w o]} rows
                   :let [w (double (or w 1.0))
@@ -299,9 +301,10 @@
             (assoc state :m mm :c c))))))
 
 (defn averaged
-  "Dynamic model averaging over `models` ({name state}, all logistic, all
-  Poisson or all linear), starting from equal weights; :forget (required) flattens the
-  weights each period, so a model's past record fades."
+  "Dynamic model averaging over `models` ({name state}, all logistic,
+  all Poisson or all linear), starting from equal weights; :forget
+  (required) flattens the weights each period, so a model's past record
+  fades."
   [models {:keys [forget]}]
   (need :averaged {:forget forget})
   (let [kinds (set (map :type (vals models)))]
