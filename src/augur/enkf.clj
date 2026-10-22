@@ -72,13 +72,13 @@
             s (double-array (for [i (range k) j (range k)] (+ (cov dh i dh j) (if (= i j) (double (nth r i)) 0.0))))
             l (cholesky s k)
             cxh (vec (for [a (range dim)] (double-array (for [j (range k)] (cov dx a dh j)))))
-            ;; the perturbations, centred and rescaled to the noise's variance
+            ;; the perturbations, centred (their n - 1 sample covariance has
+            ;; expectation R, as the gain's covariances use n - 1)
             raw (vec (repeatedly n #(double-array (for [j (range k)] (* (Math/sqrt (double (nth r j))) (m/normal! g))))))
-            em (mean-of (map vec raw))
-            scale (Math/sqrt (/ n (double (dec n))))]
+            em (mean-of (map vec raw))]
         (mapv (fn [x hx e]
                 (let [innov (double-array (for [j (range k)] (+ (- (double (nth y j)) (double (nth hx j)))
-                                                                 (* scale (- (aget ^doubles e j) (nth em j))))))
+                                                                 (- (aget ^doubles e j) (nth em j)))))
                       w (solve-chol l innov k)]
                   (mapv (fn [a xa] (+ xa (loop [j 0 acc 0.0] (if (< j k) (recur (inc j) (+ acc (* (aget ^doubles (cxh a) j) (aget w j)))) acc))))
                         (range dim) x)))

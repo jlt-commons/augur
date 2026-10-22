@@ -170,7 +170,10 @@
 
 (defn solve-spd
   "x with a x = b for a symmetric positive definite n × n matrix `a` (row
-  major), by Cholesky decomposition. Leaves `a` and `b` as they were."
+  major), by Cholesky decomposition. Leaves `a` and `b` as they were. A
+  pivot that is not positive is clamped to 1e-300, not refused: for
+  matrices positive definite by construction (a ridge's), where only
+  round-off can make one so; augur.enkf refuses instead."
   ^doubles [^doubles a ^doubles b ^long n]
   (let [^doubles l (double-array (* n n))
         ^doubles x (aclone b)]
