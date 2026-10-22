@@ -32,3 +32,22 @@
         post (e/update ens identity [1.0 -1.0] [0.25 0.25] g)]
     (is (< (Math/abs (- 0.8 (mean (map first post)))) 0.05))
     (is (< (Math/abs (+ 0.8 (mean (map second post)))) 0.05))))
+
+(deftest bad-inputs-are-refused
+  (let [g (m/rng 4) ens [[1.0] [2.0] [3.0]]]
+    (is (thrown? clojure.lang.ExceptionInfo (e/update ens identity [1.0] [0.0] g)) "zero noise")
+    (is (thrown? clojure.lang.ExceptionInfo (e/update ens identity [1.0] [Double/NaN] g)))
+    (is (thrown? clojure.lang.ExceptionInfo (e/update [[1.0]] identity [1.0] [1.0] g)) "one member")
+    (is (thrown? clojure.lang.ExceptionInfo (e/update ens identity [1.0 2.0] [1.0] g)) "a variance per observation")
+    (is (thrown? clojure.lang.ExceptionInfo (e/update [[1.0] [Double/NaN] [3.0]] identity [1.0] [1.0] g)) "a member not finite")))
+
+(deftest many-observations-at-once
+  ;; a state observed thirty times (an ensemble smoother's case): the
+  ;; posterior of a mean from thirty noisy draws
+  (let [g (m/rng 5)
+        ens (vec (repeatedly 2000 #(vector (* 3.0 (m/normal! g)))))
+        ys (vec (repeatedly 30 #(+ 1.0 (m/normal! g))))
+        post (e/update ens (fn [x] (vec (repeat 30 (first x)))) ys (vec (repeat 30 1.0)) g)
+        pv (/ 1.0 (+ (/ 1.0 9.0) 30.0))]
+    (is (< (Math/abs (- (mean (map first post)) (* pv (reduce + ys)))) 0.03))
+    (is (< (Math/abs (- (sd (map first post)) (Math/sqrt pv))) 0.02))))
