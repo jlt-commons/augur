@@ -1,8 +1,11 @@
 (ns augur.dynamic
   "Models that learn from experience: dynamic generalized linear models
   (West, Harrison & Migon 1985; West & Harrison 1997) for binary outcomes
-  (logistic) and counts (Poisson), and dynamic model averaging over them
-  (Raftery, Kárný & Ettler 2010; McCormick et al. 2012).
+  (logistic) and counts (Poisson), the dynamic linear model for
+  continuous outcomes (linear: Gaussian, its observation variance unknown
+  and learned with the coefficients, West & Harrison 1997 ch. 4), and
+  dynamic model averaging over them (Raftery, Kárný & Ettler 2010;
+  McCormick et al. 2012).
 
   A model's coefficients are a state, Gaussian with mean m and covariance
   C. Each period the state is discounted, C / delta, so old evidence fades
@@ -59,6 +62,17 @@
   [opts]
   (model :poisson opts))
 
+(defn linear
+  "A dynamic linear regression for continuous outcomes, y = x'b + noise of
+  unknown variance V: the coefficients' update is exact (the Kalman
+  filter), V's estimate :s carried with :n degrees of freedom (from :s0,
+  default 1, and :n0, default 1) and updated by each row's standardized
+  error, the coefficients' covariance rescaled with it; predictions are
+  Student t. A row's :w is a power on its likelihood (its precision
+  scaled by w), as in the other models. Options above."
+  [{:keys [s0 n0] :or {s0 1.0 n0 1.0} :as opts}]
+  (assoc (model :linear opts) :s (double s0) :n (double n0)))
+
 (defn- pick ^doubles [{:keys [inputs k]} x]
   (let [out (double-array k)]
     (if inputs
@@ -86,7 +100,8 @@
       ;; the logistic-normal integral (MacKay 1992's probit approximation)
       :logistic (m/expit (/ f (Math/sqrt (+ 1.0 (/ (* Math/PI q) 8.0)))))
       ;; the mean of a lognormal rate
-      :poisson (Math/exp (+ f (* 0.5 q))))))
+      :poisson (Math/exp (+ f (* 0.5 q)))
+      :linear f)))
 
 (defn- event?
   "A binary outcome: true, or a positive number (0 and false are none)."
@@ -160,9 +175,18 @@
   ([state x offset]
    (if (= :averaged (:type state))
      (predictive-averaged state x offset)
-     (let [{:keys [m c k discount]} state
+     (let [{:keys [m c k discount type s]} state
            [f q] (moments m c k (pick state x) (double (or offset 0.0)) (/ 1.0 discount))]
-       {:f f :q q}))))
+       (cond-> {:f f :q q} (= :linear type) (assoc :s s))))))
+
+(defn- linear-log-density
+  "log of the Student t density of y with n degrees of freedom, location f
+  and scale Q."
+  ^double [^double y ^double f ^double big-q ^double n]
+  (let [e (- y f)]
+    (- (+ (m/log-gamma (* 0.5 (+ n 1.0))) (- (m/log-gamma (* 0.5 n))))
+       (* 0.5 (Math/log (* n Math/PI big-q)))
+       (* 0.5 (+ n 1.0) (Math/log1p (/ (* e e) (* n big-q)))))))
 
 (defn- poisson-log-predictive
   "log P(y) for a count whose log rate is N(f, q): the negative binomial
@@ -192,8 +216,13 @@
                   :let [w (double (or w 1.0))
                         o (double (or o 0.0))]]
               (if (= :averaged (:type state))
-                (let [p (predict state x o)]
+                (let [p (when-not (= :linear (:kind state)) (predict state x o))]
                   (case (:kind state)
+                    ;; the mixture's density
+                    :linear (let [{:keys [models] ws :w} state
+                                  ls (for [[k mdl] models] (+ (Math/log (Math/max 1e-300 (double (ws k)))) (log-score mdl [{:x x :y y :w w :o o}])))
+                                  top (apply max ls)]
+                              (+ top (Math/log (reduce + (map #(Math/exp (- % top)) ls)))))
                     :logistic (* w (Math/log (Math/max 1e-300 (if (event? y) p (- 1.0 p)))))
                     ;; the mixture's mean only: a period's evidence is scored per model
                     :poisson (* w (- (* (double y) (Math/log (Math/max 1e-300 p))) p (m/log-gamma (+ 1.0 (double y)))))))
@@ -201,7 +230,9 @@
                   :logistic (let [p (predict state x o)]
                               (* w (Math/log (Math/max 1e-300 (if (event? y) p (- 1.0 p))))))
                   :poisson (let [[f q] (moments (:m state) (:c state) (:k state) (pick state x) o (/ 1.0 (:discount state)))]
-                             (* w (poisson-log-predictive f q (double y)))))))))
+                             (* w (poisson-log-predictive f q (double y))))
+                  :linear (let [[f q] (moments (:m state) (:c state) (:k state) (pick state x) o (/ 1.0 (:discount state)))]
+                            (* w (linear-log-density (double y) f (+ q (:s state)) (:n state)))))))))
 
 (defn step
   "The state after a period: discounted, then updated with each of `rows`."
@@ -212,9 +243,29 @@
           mm (aclone ^doubles (:m state))
           ^doubles c (aclone ^doubles (:c state))]
       (dotimes [i (* k k)] (aset c i (/ (aget c i) discount)))
-      (doseq [{:keys [x y w o]} rows]
-        (update-row! type mm c k (pick state x) y (double (or w 1.0)) (double (or o 0.0))))
-      (assoc state :m mm :c c))))
+      (if (= :linear type)
+        ;; the Kalman update, V's estimate learned with it (West & Harrison 4.6)
+        (loop [[{:keys [x y w o]} & more] rows s (double (:s state)) n (double (:n state))]
+          (if (nil? x)
+            (assoc state :m mm :c c :s s :n n)
+            (let [x (pick state x) w (double (or w 1.0))
+                  [f q] (moments mm c k x (double (or o 0.0)) 1.0)
+                  big-q (+ (double q) (/ s w))
+                  e (- (double y) (double f))
+                  cx (double-array k)]
+              (dotimes [i k]
+                (aset cx i (loop [j 0 acc 0.0] (if (< j k) (recur (inc j) (+ acc (* (aget c (+ (* i k) j)) (aget x j)))) acc))))
+              (let [n' (+ n w)
+                    s' (Math/max 1e-12 (+ s (* (/ (* w s) n') (- (/ (* e e) big-q) 1.0))))
+                    r (/ s' s)]
+                (dotimes [i k] (aset mm i (+ (aget mm i) (/ (* (aget cx i) e) big-q))))
+                (dotimes [i k]
+                  (dotimes [j k]
+                    (aset c (+ (* i k) j) (* r (- (aget c (+ (* i k) j)) (/ (* (aget cx i) (aget cx j)) big-q))))))
+                (recur more s' n')))))
+        (do (doseq [{:keys [x y w o]} rows]
+              (update-row! type mm c k (pick state x) y (double (or w 1.0)) (double (or o 0.0))))
+            (assoc state :m mm :c c))))))
 
 (defn averaged
   "Dynamic model averaging over `models` ({name state}, all logistic or all

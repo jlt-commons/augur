@@ -138,3 +138,69 @@
       (is (< (Math/abs (- f -0.5)) 1e-12))
       ;; within, 0.25 0.1 + 0.75 0.3 = 0.25, plus between, 1 - 0.5^2 = 0.75
       (is (< (Math/abs (- q 1.0)) 1e-9)))))
+
+;; --- the dynamic linear model (West & Harrison 1997, ch. 4: the
+;; observation variance unknown, learned with the coefficients) ----------
+
+(defn- linear-rows [g n beta sd]
+  (vec (for [_ (range n)]
+         (let [x [1.0 (m/normal! g) (m/normal! g)]]
+           {:x x :y (+ (reduce + (map * beta x)) (* sd (m/normal! g)))}))))
+
+(deftest linear-learns-coefficients-and-noise
+  (let [g (m/rng 11)
+        s (run (d/linear {:mean [0 0 0] :var [100 100 100] :discount 1.0})
+               (repeatedly 40 #(linear-rows g 25 [2.0 3.0 -1.0] 0.5)))]
+    (is (every? true? (map #(< (Math/abs (- %1 %2)) 0.05) (d/means s) [2.0 3.0 -1.0])) (d/means s))
+    (is (< 0.2 (:s s) 0.3) "the observation variance, 0.25")
+    (is (< (Math/abs (- 4.6 (d/predict s [1.0 1.0 0.4]))) 0.1) "the mean")
+    (let [{:keys [f q s]} (d/predictive s [1.0 1.0 0.4])]
+      (is (< 4.5 f 4.7))
+      (is (< q 0.01) "the coefficients well known")
+      (is (< 0.2 s 0.3) "and the noise beside them"))))
+
+(deftest linear-follows-a-change
+  (let [g (m/rng 12)
+        periods (concat (repeatedly 30 #(linear-rows g 20 [0.0 1.0 0.0] 0.3))
+                        (repeatedly 30 #(linear-rows g 20 [0.0 -1.0 0.0] 0.3)))
+        moving (run (d/linear {:mean [0 0 0] :var [10 10 10] :discount 0.9}) periods)
+        fixed (run (d/linear {:mean [0 0 0] :var [10 10 10] :discount 1.0}) periods)]
+    (is (< (second (d/means moving)) -0.9))
+    (is (> (second (d/means fixed)) -0.2) "without a discount, the average of both")))
+
+(deftest linear-scores-and-averages
+  ;; the log predictive density (Student t) is higher under the right
+  ;; model, and the average finds it
+  (let [g (m/rng 13)
+        periods (repeatedly 40 #(linear-rows g 20 [0.0 0.0 2.0] 0.5))
+        a (d/linear {:mean [0 0] :var [10 10] :discount 1.0 :inputs [0 1]})
+        b (d/linear {:mean [0 0] :var [10 10] :discount 1.0 :inputs [0 2]})
+        sa (run a (take 10 periods)) sb (run b (take 10 periods))
+        test (nth periods 20)]
+    (is (> (d/log-score sb test) (+ 20.0 (d/log-score sa test))))
+    (let [avg (run (d/averaged {:z1 a :z2 b} {:forget 1.0}) periods)]
+      (is (> (get (d/weights avg) :z2) 0.99))
+      (is (< (Math/abs (- 2.0 (d/predict avg [1.0 0.0 1.0]))) 0.1)))))
+
+(deftest linear-weights-and-offsets
+  ;; a row's :w scales its precision, its :o is a fixed part of the mean
+  (let [g (m/rng 14)
+        rows (fn [] (vec (for [_ (range 20)] (let [x [1.0 (m/normal! g)]] {:x x :y (+ 5.0 (* 2.0 (second x)) (* 0.1 (m/normal! g))) :o 5.0}))))
+        s (run (d/linear {:mean [0 0] :var [10 10] :discount 1.0}) (repeatedly 20 rows))]
+    (is (< (Math/abs (first (d/means s))) 0.05) "the offset carries the 5")
+    (is (< (Math/abs (- 2.0 (second (d/means s)))) 0.05))
+    (is (thrown? clojure.lang.ExceptionInfo (d/linear {:mean [0] :var [1]})) "a discount is required")))
+
+(deftest linear-mixture-density
+  ;; an average's log score is the log of its weighted mixture of densities
+  (let [a (d/linear {:mean [0.0] :var [1.0] :discount 1.0})
+        b (d/linear {:mean [3.0] :var [1.0] :discount 1.0})
+        avg (d/averaged {:a a :b b} {:forget 1.0})
+        row {:x [1.0] :y 1.0}
+        la (d/log-score a [row]) lb (d/log-score b [row])]
+    (is (< (Math/abs (- (d/log-score avg [row]) (Math/log (+ (* 0.5 (Math/exp la)) (* 0.5 (Math/exp lb)))))) 1e-9))
+    (is (< (Math/abs (- (d/log-score avg [(assoc row :w 2.0)])
+                        (Math/log (+ (* 0.5 (Math/exp (d/log-score a [(assoc row :w 2.0)])))
+                                     (* 0.5 (Math/exp (d/log-score b [(assoc row :w 2.0)])))))))
+           1e-9)
+        "the row's weight reaches each model")))
