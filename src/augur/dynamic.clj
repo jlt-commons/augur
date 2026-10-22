@@ -67,10 +67,17 @@
   unknown variance V: the coefficients' update is exact (the Kalman
   filter), V's estimate :s carried with :n degrees of freedom (from :s0,
   default 1, and :n0, default 1) and updated by each row's standardized
-  error, the coefficients' covariance rescaled with it; predictions are
-  Student t. A row's :w is a power on its likelihood (its precision
-  scaled by w), as in the other models. Options above."
+  error, the coefficients' covariance rescaled with it; the outcome's
+  predictive is Student t with n degrees of freedom, location f and scale
+  q + s. :var is the coefficients' prior covariance at V = s0: as V's
+  estimate moves the covariance moves with it, so a wrong s0 also widens
+  or narrows that prior. A row's :w is a power on its likelihood (its
+  precision scaled by w, the row counted w times), as in the other
+  models. V does not drift (no variance discount): the noise is taken as
+  constant while the coefficients move. Options above."
   [{:keys [s0 n0] :or {s0 1.0 n0 1.0} :as opts}]
+  (when-not (and (pos? (double s0)) (pos? (double n0)))
+    (throw (ex-info "augur.dynamic/linear needs a positive :s0 and :n0" {:s0 s0 :n0 n0})))
   (assoc (model :linear opts) :s (double s0) :n (double n0)))
 
 (defn- pick ^doubles [{:keys [inputs k]} x]
@@ -149,9 +156,10 @@
 (declare step-averaged predict-averaged)
 
 (defn predict
-  "The probability of the outcome (logistic) or the expected count
-  (Poisson) for inputs x in the coming period, the coefficients'
-  uncertainty integrated over; `offset` as a row's :o."
+  "The probability of the outcome (logistic), the expected count
+  (Poisson) or the expected value (linear) for inputs x in the coming
+  period, the coefficients' uncertainty integrated over; `offset` as a
+  row's :o."
   ([state x] (predict state x 0.0))
   ([state x offset]
    (if (= :averaged (:type state))
@@ -160,24 +168,29 @@
 
 (declare predictive)
 
-(defn- predictive-averaged [{:keys [models w]} x offset]
+(defn- predictive-averaged [{:keys [models w kind]} x offset]
   (let [ms (for [[k mdl] models] [(w k) (predictive mdl x offset)])
         f (reduce + (for [[wk {:keys [f]}] ms] (* wk f)))]
-    {:f f
-     ;; the mixture's variance: within the models plus between their means
-     :q (- (reduce + (for [[wk {f' :f q' :q}] ms] (* wk (+ q' (* f' f'))))) (* f f))}))
+    (cond-> {:f f
+             ;; the mixture's variance: within the models plus between their means
+             :q (- (reduce + (for [[wk {f' :f q' :q}] ms] (* wk (+ q' (* f' f'))))) (* f f))}
+      ;; the noise beside it, the models' estimates weighted
+      (= :linear kind) (assoc :s (reduce + (for [[wk {s' :s}] ms] (* wk s')))))))
 
 (defn predictive
   "The linear predictor's predictive moments for inputs x in the coming
   period, {:f mean :q variance}, `offset` included in the mean; for a model
-  average, the mixture's mean and variance. What predict integrates over."
+  average, the mixture's mean and variance. What predict integrates over.
+  A linear model adds the noise's estimate :s and its degrees of freedom
+  :n (the outcome Student t, scale q + s); an average of them, :s
+  weighted."
   ([state x] (predictive state x 0.0))
   ([state x offset]
    (if (= :averaged (:type state))
      (predictive-averaged state x offset)
      (let [{:keys [m c k discount type s]} state
            [f q] (moments m c k (pick state x) (double (or offset 0.0)) (/ 1.0 discount))]
-       (cond-> {:f f :q q} (= :linear type) (assoc :s s))))))
+       (cond-> {:f f :q q} (= :linear type) (assoc :s s :n (:n state)))))))
 
 (defn- linear-log-density
   "log of the Student t density of y with n degrees of freedom, location f
@@ -220,9 +233,11 @@
                   (case (:kind state)
                     ;; the mixture's density
                     :linear (let [{:keys [models] ws :w} state
-                                  ls (for [[k mdl] models] (+ (Math/log (Math/max 1e-300 (double (ws k)))) (log-score mdl [{:x x :y y :w w :o o}])))
+                                  ls (for [[k mdl] models]
+                                       (+ (Math/log (Math/max 1e-300 (double (ws k))))
+                                          (log-score mdl [{:x x :y y :o o}])))
                                   top (apply max ls)]
-                              (+ top (Math/log (reduce + (map #(Math/exp (- % top)) ls)))))
+                              (* w (+ top (Math/log (reduce + (map #(Math/exp (- % top)) ls))))))
                     :logistic (* w (Math/log (Math/max 1e-300 (if (event? y) p (- 1.0 p)))))
                     ;; the mixture's mean only: a period's evidence is scored per model
                     :poisson (* w (- (* (double y) (Math/log (Math/max 1e-300 p))) p (m/log-gamma (+ 1.0 (double y)))))))
@@ -234,42 +249,58 @@
                   :linear (let [[f q] (moments (:m state) (:c state) (:k state) (pick state x) o (/ 1.0 (:discount state)))]
                             (* w (linear-log-density (double y) f (+ q (:s state)) (:n state)))))))))
 
+(defn- linear-step
+  "[state log-evidence] of a linear model after `rows`, its mean `mm` and
+  covariance `c` (already discounted) updated in place: the Kalman update,
+  V's estimate learned with it (West & Harrison 4.6), and each row's log
+  predictive given the rows before it."
+  [state ^doubles mm ^doubles c rows]
+  (let [k (long (:k state))]
+    (loop [rows (seq rows) s (double (:s state)) n (double (:n state)) ll 0.0]
+      (if-not rows
+        [(assoc state :m mm :c c :s s :n n) ll]
+        (let [{:keys [x y w o]} (first rows)
+              x (pick state x) w (double (or w 1.0))
+              [f q] (moments mm c k x (double (or o 0.0)) 1.0)
+              e (- (double y) (double f))
+              ll (+ ll (* w (linear-log-density (double y) (double f) (+ (double q) s) n)))
+              big-q (+ (double q) (/ s w))
+              cx (double-array k)]
+          (dotimes [i k]
+            (aset cx i (loop [j 0 acc 0.0] (if (< j k) (recur (inc j) (+ acc (* (aget c (+ (* i k) j)) (aget x j)))) acc))))
+          ;; the likelihood to the power w: shape + w/2, rate + s e^2/(2Q)
+          (let [n' (+ n w)
+                s' (Math/max 1e-12 (+ s (* (/ s n') (- (/ (* e e) big-q) w))))
+                r (/ s' s)]
+            (dotimes [i k] (aset mm i (+ (aget mm i) (/ (* (aget cx i) e) big-q))))
+            (dotimes [i k]
+              (dotimes [j k]
+                (aset c (+ (* i k) j) (* r (- (aget c (+ (* i k) j)) (/ (* (aget cx i) (aget cx j)) big-q))))))
+            (recur (next rows) s' n' ll)))))))
+
+(defn- discounted [state]
+  (let [{:keys [k discount]} state
+        mm (aclone ^doubles (:m state))
+        ^doubles c (aclone ^doubles (:c state))]
+    (dotimes [i (* k k)] (aset c i (/ (aget c i) discount)))
+    [mm c]))
+
 (defn step
   "The state after a period: discounted, then updated with each of `rows`."
   [state rows]
   (if (= :averaged (:type state))
     (step-averaged state rows)
-    (let [{:keys [type k discount]} state
-          mm (aclone ^doubles (:m state))
-          ^doubles c (aclone ^doubles (:c state))]
-      (dotimes [i (* k k)] (aset c i (/ (aget c i) discount)))
+    (let [{:keys [type k]} state
+          [mm c] (discounted state)]
       (if (= :linear type)
-        ;; the Kalman update, V's estimate learned with it (West & Harrison 4.6)
-        (loop [[{:keys [x y w o]} & more] rows s (double (:s state)) n (double (:n state))]
-          (if (nil? x)
-            (assoc state :m mm :c c :s s :n n)
-            (let [x (pick state x) w (double (or w 1.0))
-                  [f q] (moments mm c k x (double (or o 0.0)) 1.0)
-                  big-q (+ (double q) (/ s w))
-                  e (- (double y) (double f))
-                  cx (double-array k)]
-              (dotimes [i k]
-                (aset cx i (loop [j 0 acc 0.0] (if (< j k) (recur (inc j) (+ acc (* (aget c (+ (* i k) j)) (aget x j)))) acc))))
-              (let [n' (+ n w)
-                    s' (Math/max 1e-12 (+ s (* (/ (* w s) n') (- (/ (* e e) big-q) 1.0))))
-                    r (/ s' s)]
-                (dotimes [i k] (aset mm i (+ (aget mm i) (/ (* (aget cx i) e) big-q))))
-                (dotimes [i k]
-                  (dotimes [j k]
-                    (aset c (+ (* i k) j) (* r (- (aget c (+ (* i k) j)) (/ (* (aget cx i) (aget cx j)) big-q))))))
-                (recur more s' n')))))
+        (first (linear-step state mm c rows))
         (do (doseq [{:keys [x y w o]} rows]
               (update-row! type mm c k (pick state x) y (double (or w 1.0)) (double (or o 0.0))))
             (assoc state :m mm :c c))))))
 
 (defn averaged
-  "Dynamic model averaging over `models` ({name state}, all logistic or all
-  Poisson), starting from equal weights; :forget (required) flattens the
+  "Dynamic model averaging over `models` ({name state}, all logistic, all
+  Poisson or all linear), starting from equal weights; :forget (required) flattens the
   weights each period, so a model's past record fades."
   [models {:keys [forget]}]
   (need :averaged {:forget forget})
@@ -289,7 +320,13 @@
         z (reduce + (vals flat))
         prior (update-vals flat #(/ % z))
         ;; each model's evidence: how likely it made the period's outcomes
-        ll (into {} (for [[k mdl] models] [k (log-score mdl rows)]))
+        ;; a linear model's is exact and sequential: each row given the
+        ;; ones before it (its step computes it)
+        stepped (into {} (for [[k mdl] models]
+                           [k (if (= :linear (:type mdl))
+                                (let [[mm c] (discounted mdl)] (linear-step mdl mm c rows))
+                                [nil (log-score mdl rows)])]))
+        ll (update-vals stepped second)
         top (apply max (vals ll))
         post (into {} (for [[k p] prior] [k (* p (Math/exp (- (ll k) top)))]))
         z (reduce + (vals post))
@@ -301,7 +338,7 @@
         z 1.0]
     (assoc avg
            :w (update-vals post #(/ % z))
-           :models (update-vals models #(step % rows)))))
+           :models (into {} (for [[k mdl] models] [k (or (first (stepped k)) (step mdl rows))])))))
 
 (defn couple
   "Two models of one layout learning from each other's experience: each

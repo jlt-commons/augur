@@ -192,15 +192,81 @@
     (is (thrown? clojure.lang.ExceptionInfo (d/linear {:mean [0] :var [1]})) "a discount is required")))
 
 (deftest linear-mixture-density
-  ;; an average's log score is the log of its weighted mixture of densities
+  ;; an average's log score: the row's weight a power on the mixture
   (let [a (d/linear {:mean [0.0] :var [1.0] :discount 1.0})
         b (d/linear {:mean [3.0] :var [1.0] :discount 1.0})
         avg (d/averaged {:a a :b b} {:forget 1.0})
         row {:x [1.0] :y 1.0}
-        la (d/log-score a [row]) lb (d/log-score b [row])]
-    (is (< (Math/abs (- (d/log-score avg [row]) (Math/log (+ (* 0.5 (Math/exp la)) (* 0.5 (Math/exp lb)))))) 1e-9))
-    (is (< (Math/abs (- (d/log-score avg [(assoc row :w 2.0)])
-                        (Math/log (+ (* 0.5 (Math/exp (d/log-score a [(assoc row :w 2.0)])))
-                                     (* 0.5 (Math/exp (d/log-score b [(assoc row :w 2.0)])))))))
-           1e-9)
-        "the row's weight reaches each model")))
+        la (d/log-score a [row]) lb (d/log-score b [row])
+        mix (Math/log (+ (* 0.5 (Math/exp la)) (* 0.5 (Math/exp lb))))]
+    (is (< (Math/abs (- (d/log-score avg [row]) mix)) 1e-9))
+    (is (< (Math/abs (- (d/log-score avg [(assoc row :w 2.0)]) (* 2.0 mix))) 1e-9))))
+
+(defn- close? [a b tol] (every? true? (map #(< (Math/abs (- (double %1) (double %2))) tol) a b)))
+
+(deftest linear-matches-the-batch-posterior
+  ;; with no discount, the sequential update is the conjugate batch
+  ;; posterior (normal-inverse-gamma): prior C0* = var/s0, d0 = n0 s0, P =
+  ;; C0*^-1 + X'X, b = P^-1 (C0*^-1 m0 + X'y), S = (d0 + y'y + m0'C0*^-1 m0
+  ;; - b'Pb)/(n0 + N), C = S P^-1; here in one input, closed form
+  (let [m0 2.0 v 4.0 s0 1.5 n0 3.0
+        xs [0.5 -1.0 2.0 1.5] ys [1.0 -2.5 4.2 2.9]
+        st (reduce #(d/step %1 [%2]) (d/linear {:mean [m0] :var [v] :discount 1.0 :s0 s0 :n0 n0})
+                   (map (fn [x y] {:x [x] :y y}) xs ys))
+        c0 (/ v s0) p (+ (/ 1.0 c0) (reduce + (map #(* % %) xs)))
+        b (/ (+ (/ m0 c0) (reduce + (map * xs ys))) p)
+        sv (/ (+ (* n0 s0) (reduce + (map #(* % %) ys)) (/ (* m0 m0) c0) (- (* b b p))) (+ n0 (count xs)))]
+    (is (close? (d/means st) [b] 1e-12))
+    (is (< (Math/abs (- (:s st) sv)) 1e-12))
+    (is (< (Math/abs (- (aget ^doubles (:c st) 0) (/ sv p))) 1e-12))
+    (is (= (+ n0 4.0) (:n st)))))
+
+(deftest a-weight-is-the-row-repeated
+  ;; :w 2 is the same row twice in the period
+  (let [mk #(d/linear {:mean [0.0 0.0] :var [4.0 4.0] :discount 1.0 :s0 1.0 :n0 3.0})
+        row {:x [1.0 0.5] :y 3.0}
+        once (d/step (mk) [(assoc row :w 2.0)])
+        twice (d/step (mk) [row row])]
+    (is (close? (d/means once) (d/means twice) 1e-12))
+    (is (< (Math/abs (- (:s once) (:s twice))) 1e-12))
+    (is (close? (vec (:c once)) (vec (:c twice)) 1e-12))
+    (is (= (:n once) (:n twice)))))
+
+(deftest linear-densities-and-discounts
+  (testing "one degree of freedom: the Cauchy"
+    (let [st (d/linear {:mean [1.0] :var [0.5] :discount 1.0 :s0 2.0 :n0 1.0})
+          big-q 2.5 e 1.0]
+      (is (< (Math/abs (- (d/log-score st [{:x [1.0] :y 2.0}])
+                          (- (Math/log (* Math/PI (Math/sqrt big-q) (+ 1.0 (/ (* e e) big-q)))))))
+             1e-12))))
+  (testing "the predictive under a discount: x'Cx/delta, and the noise beside it"
+    (let [st (d/linear {:mean [0.0 0.0] :var [1.0 2.0] :discount 0.8 :s0 0.3 :n0 4.0})
+          {:keys [q s n]} (d/predictive st [1.0 1.0])]
+      (is (< (Math/abs (- q (/ 3.0 0.8))) 1e-12))
+      (is (= 0.3 s)) (is (= 4.0 n))))
+  (testing "a period without rows: only the discount"
+    (let [st (d/step (d/linear {:mean [1.0] :var [1.0] :discount 0.5 :s0 0.3 :n0 4.0}) [])]
+      (is (= [1.0] (d/means st))) (is (= 0.3 (:s st))) (is (= 4.0 (:n st)))
+      (is (= 2.0 (aget ^doubles (:c st) 0)))))
+  (testing "the averaged predictive carries the noise"
+    (let [avg (d/averaged {:a (d/linear {:mean [0.0] :var [1.0] :discount 1.0 :s0 0.2})
+                           :b (d/linear {:mean [0.0] :var [1.0] :discount 1.0 :s0 0.4})} {:forget 1.0})]
+      (is (< (Math/abs (- 0.3 (:s (d/predictive avg [1.0])))) 1e-12))))
+  (testing "a row without inputs throws, as for the other models"
+    (is (thrown? Exception (d/step (d/linear {:mean [0.0] :var [1.0] :discount 1.0}) [{:y 1.0} {:x [1.0] :y 2.0}]))))
+  (testing "the noise's prior must be positive"
+    (is (thrown? clojure.lang.ExceptionInfo (d/linear {:mean [0.0] :var [1.0] :discount 1.0 :s0 0.0})))
+    (is (thrown? clojure.lang.ExceptionInfo (d/linear {:mean [0.0] :var [1.0] :discount 1.0 :n0 0.0})))))
+
+(deftest averaging-linear-models-on-sequential-evidence
+  ;; a period's evidence for a linear model is the product of each row's
+  ;; predictive given the rows before it: the marginal likelihood, so many
+  ;; rows of an uncertain model are not counted as if independent
+  (let [mk #(d/linear {:mean [0.0] :var [10.0] :discount 1.0 :s0 1.0 :n0 2.0})
+        rows (vec (for [y [0.5 1.5 1.0 0.8]] {:x [1.0] :y y}))
+        seq-ll (first (reduce (fn [[ll st] r] [(+ ll (d/log-score st [r])) (d/step st [r])]) [0.0 (mk)] rows))
+        other (d/linear {:mean [5.0] :var [0.01] :discount 1.0 :s0 1.0 :n0 2.0})
+        other-ll (first (reduce (fn [[ll st] r] [(+ ll (d/log-score st [r])) (d/step st [r])]) [0.0 other] rows))
+        avg (d/step (d/averaged {:a (mk) :b other} {:forget 1.0}) rows)
+        expect (/ 1.0 (+ 1.0 (Math/exp (- other-ll seq-ll))))]
+    (is (< (Math/abs (- (get (d/weights avg) :a) (+ (* (- 1.0 1e-6) expect) 0.5e-6))) 1e-9))))
