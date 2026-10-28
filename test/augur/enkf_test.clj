@@ -55,6 +55,7 @@
 ;; -- linear equality constraints (accounting identities) --------------------------------
 
 (defn- dot [a b] (reduce + (map * a b)))
+(defn- norm [a] (Math/sqrt (dot a a)))
 
 (deftest a-projection-lands-on-the-constraints-nearest
   ;; x1 + x2 + x3 = 6 and x1 - x3 = 0: the nearest point to (1 2 3) is
@@ -107,3 +108,26 @@
         ens (vec (for [_ (range 400)] [(+ 1.0 (* 0.5 (m/normal! g)))]))
         post (e/update ens (fn [x i] [(- (first x) (* 2.0 (s i)))]) [0.0] [1e-4] g {:indexed true})]
     (is (< (mean (map (fn [x i] (Math/abs (- (/ (first x) (s i)) 2.0))) post (range))) 0.05))))
+
+(deftest a-projection-at-the-scale-of-national-accounts
+  ;; levels of 1e7 (millions of a currency), rank-deficient rows (one the
+  ;; sum of two others, one zero): on the constraints to rounding, the
+  ;; correction in the rows' span (orthogonal to their null space), and a
+  ;; second projection does not move it
+  (let [g (m/rng 21)
+        dim 12
+        rows (vec (for [_ (range 5)] (vec (for [_ (range dim)] (- (Math/floor (* 5.0 (m/next-double! g))) 2.0)))))
+        a (conj rows (mapv + (rows 0) (rows 3)) (vec (repeat dim 0.0)))
+        x0 (vec (for [_ (range dim)] (* 1e7 (m/normal! g))))
+        b (conj (mapv #(dot % x0) rows) (+ (dot (rows 0) x0) (dot (rows 3) x0)) 0.0)
+        x (mapv #(+ % (* 1e5 (m/normal! g))) x0)
+        p (e/project x a b)
+        scale (reduce max (map #(Math/abs %) x))]
+    (is (every? #(< (Math/abs %) (* 1e-12 scale)) (map - (map #(dot % p) a) b)) "on the constraints")
+    (is (every? #(< (Math/abs %) (* 1e-12 scale)) (map - (e/project p a b) p)) "idempotent")
+    (testing "the correction is orthogonal to every direction the constraints allow"
+      ;; x0 - p lies in the null space (both on the constraints)
+      (let [d (map - x p) z (map - x0 p)]
+        (is (< (Math/abs (dot d z)) (* 1e-9 (norm d) (norm z))))))
+    (testing "a zero row: allowed with a zero right-hand side, refused with another"
+      (is (thrown? clojure.lang.ExceptionInfo (e/project x a (assoc b (dec (count b)) 1.0)))))))

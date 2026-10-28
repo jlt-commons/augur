@@ -144,9 +144,15 @@
 
 (defn update-constrained
   "update, then each member projected onto its linear constraints {:a rows
-  :b right-hand side} or {:a :b-of (fn [member index]) -> b}: identities
-  every member holds stay held exactly, as the update alone keeps them
-  only to rounding, and only when every member's b is the same."
+  :b right-hand side} or {:a :b-of (fn [index]) -> b} (member index's):
+  identities every member holds stay held exactly, as the update alone
+  keeps them only to rounding, and only when every member's b is the
+  same. The projection is project's, Euclidean: where every b is the
+  same it removes rounding alone (the update moves a member along the
+  ensemble's deviations, which keep the identities); where they differ
+  it is the least-squares correction, not one weighted by the ensemble's
+  covariance (whose rank, members less one, is too small to meet many
+  constraints)."
   [ens h y r g {:keys [a b b-of indexed]}]
   (let [post (update ens h y r g {:indexed indexed})
         p (projector a)]
