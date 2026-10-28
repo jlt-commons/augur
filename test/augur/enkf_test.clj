@@ -87,3 +87,14 @@
       (let [bs (vec (for [i (range 50)] [(double i)]))
             q (e/update-constrained ens (fn [x] [(first x)]) [1.2e6] [1e8] g {:a a :b-of (fn [i] (bs i))})]
         (is (every? (fn [[i x]] (< (Math/abs (- (dot (first a) x) i)) 1e-8)) (map-indexed vector q)))))))
+
+(deftest each-members-right-hand-side-from-one-basis
+  ;; update-constrained with :b-of factors the constraints once: the same
+  ;; members as projecting each on its own
+  (let [g1 (m/rng 9) g2 (m/rng 9)
+        ens (vec (for [i (range 6)] [(double i) (* 2.0 i) 1.0 (- i)]))
+        a [[1.0 1.0 0.0 0.0] [0.0 1.0 1.0 0.0] [1.0 2.0 1.0 0.0]]
+        b-of (fn [i] [(double i) 1.0 (+ i 1.0)])
+        fast (e/update-constrained ens (fn [x] [(nth x 3)]) [0.5] [0.1] g1 {:a a :b-of b-of})
+        slow (map-indexed (fn [i x] (e/project x a (b-of i))) (e/update ens (fn [x] [(nth x 3)]) [0.5] [0.1] g2))]
+    (is (every? true? (map (fn [x y] (every? #(< (Math/abs %) 1e-12) (map - x y))) fast slow)))))

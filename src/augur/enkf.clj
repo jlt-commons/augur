@@ -88,45 +88,55 @@
 
 ;; -- linear equality constraints ---------------------------------------------------
 
-(defn- orthonormal
-  "[[q d] ...]: the rows of `a` with right-hand sides `b`, orthonormalized
-  by modified Gram-Schmidt run twice (the rows' span, d carried along).
-  A row that is a combination of earlier ones is dropped when its
-  right-hand side agrees with theirs; throws when it does not."
-  [a b]
-  (reduce (fn [qs [row c]]
-            (let [r (double-array row)
-                  n0 (Math/sqrt (areduce r i s 0.0 (+ s (* (aget r i) (aget r i)))))
-                  c0 (Math/abs (double c))
-                  c (loop [pass 0 c (double c)]
-                      (if (= pass 2)
-                        c
-                        (recur (inc pass)
-                               (reduce (fn [c [^doubles q d]]
-                                         (let [k (areduce r i s 0.0 (+ s (* (aget r i) (aget q i))))]
-                                           (dotimes [i (alength r)] (aset r i (- (aget r i) (* k (aget q i)))))
-                                           (- c (* k (double d)))))
-                                       c qs))))
-                  nr (Math/sqrt (areduce r i s 0.0 (+ s (* (aget r i) (aget r i)))))]
-              (if (<= nr (* 1e-10 n0))
-                (if (<= (Math/abs c) (* 1e-8 (max 1.0 c0 n0)))
-                  qs
-                  (throw (ex-info "augur.enkf/project: contradictory constraints" {:residual c})))
-                (do (dotimes [i (alength r)] (aset r i (/ (aget r i) nr)))
-                    (conj qs [r (/ c nr)])))))
-          [] (map vector a b)))
+(defn- basis
+  "[[q c] ...]: the rows of `a` orthonormalized by modified Gram-Schmidt
+  run twice, each q with its coefficients c over the rows (q = sum c_i
+  a_i), so q's right-hand side for any b is c . b. A row that is a
+  combination of earlier ones is dropped, with its combination
+  (:dependent [[row c] ...]) to check b against."
+  [a]
+  (let [m (count a)]
+    (reduce (fn [{:keys [qs] :as acc} [j row]]
+              (let [r (double-array row)
+                    c (double-array m)
+                    _ (aset c j 1.0)
+                    n0 (Math/sqrt (areduce r i s 0.0 (+ s (* (aget r i) (aget r i)))))]
+                (dotimes [_ 2]
+                  (doseq [[^doubles q ^doubles cq] qs]
+                    (let [k (areduce r i s 0.0 (+ s (* (aget r i) (aget q i))))]
+                      (dotimes [i (alength r)] (aset r i (- (aget r i) (* k (aget q i)))))
+                      (dotimes [i m] (aset c i (- (aget c i) (* k (aget cq i))))))))
+                (let [nr (Math/sqrt (areduce r i s 0.0 (+ s (* (aget r i) (aget r i)))))]
+                  (if (<= nr (* 1e-10 n0))
+                    (clojure.core/update acc :dependent conj [n0 c])
+                    (do (dotimes [i (alength r)] (aset r i (/ (aget r i) nr)))
+                        (dotimes [i m] (aset c i (/ (aget c i) nr)))
+                        (clojure.core/update acc :qs conj [r c]))))))
+            {:qs [] :dependent []} (map-indexed vector a))))
+
+(defn- dot-c ^double [^doubles c b] (loop [i 0 s 0.0] (if (< i (alength c)) (recur (inc i) (+ s (* (aget c i) (double (nth b i))))) s)))
+
+(defn- projector
+  "(fn [x b]) -> x projected onto A x = b, from basis's factoring of `a`;
+  throws when b contradicts a dependent row."
+  [a]
+  (let [{:keys [qs dependent]} (basis a)]
+    (fn [x b]
+      (doseq [[n0 c] dependent :let [res (dot-c c b)]]
+        (when (> (Math/abs res) (* 1e-8 (max 1.0 n0 (reduce max 0.0 (map #(Math/abs (double %)) b)))))
+          (throw (ex-info "augur.enkf/project: contradictory constraints" {:residual res}))))
+      (let [x (double-array x)]
+        (doseq [[^doubles q c] qs]
+          (let [k (- (areduce q i s 0.0 (+ s (* (aget q i) (aget x i)))) (dot-c c b))]
+            (dotimes [i (alength x)] (aset x i (- (aget x i) (* k (aget q i)))))))
+        (vec x)))))
 
 (defn project
   "The point nearest `x` (Euclidean) on {x : A x = b}, `a` the rows of A:
   x - A'(A A')^+ (A x - b), rows that repeat others allowed (Simon & Chia
   2002's projection of a Kalman estimate onto equality constraints)."
   [x a b]
-  (let [qs (orthonormal a b)
-        x (double-array x)]
-    (doseq [[^doubles q d] qs]
-      (let [k (- (areduce q i s 0.0 (+ s (* (aget q i) (aget x i)))) (double d))]
-        (dotimes [i (alength x)] (aset x i (- (aget x i) (* k (aget q i)))))))
-    (vec x)))
+  ((projector a) x b))
 
 (defn update-constrained
   "update, then each member projected onto its linear constraints {:a rows
@@ -134,13 +144,6 @@
   every member holds stay held exactly, as the update alone keeps them
   only to rounding, and only when every member's b is the same."
   [ens h y r g {:keys [a b b-of]}]
-  (let [post (update ens h y r g)]
-    (if b
-      (let [qs (orthonormal a b)]
-        (mapv (fn [x] (let [x (double-array x)]
-                        (doseq [[^doubles q d] qs]
-                          (let [k (- (areduce q i s 0.0 (+ s (* (aget q i) (aget x i)))) (double d))]
-                            (dotimes [i (alength x)] (aset x i (- (aget x i) (* k (aget q i)))))))
-                        (vec x)))
-              post))
-      (vec (map-indexed (fn [i x] (project x a (b-of i))) post)))))
+  (let [post (update ens h y r g)
+        p (projector a)]
+    (vec (map-indexed (fn [i x] (p x (if b b (b-of i)))) post))))
