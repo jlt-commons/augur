@@ -9,7 +9,9 @@
   1998), the perturbations centred. Repeated with the noise inflated (R
   times a, the inflations' reciprocals summing to one) it is the ensemble
   smoother with multiple data assimilation (Emerick & Reynolds 2013), the
-  calibration of a deterministic model's parameters."
+  calibration of a deterministic model's parameters. Linear identities
+  the members hold (accounting) are kept by projecting each member onto
+  them after the update (project, update-constrained)."
   (:refer-clojure :exclude [update])
   (:require [augur.math :as m]))
 
@@ -83,3 +85,62 @@
                   (mapv (fn [a xa] (+ xa (loop [j 0 acc 0.0] (if (< j k) (recur (inc j) (+ acc (* (aget ^doubles (cxh a) j) (aget w j)))) acc))))
                         (range dim) x)))
               ens hs raw)))))
+
+;; -- linear equality constraints ---------------------------------------------------
+
+(defn- orthonormal
+  "[[q d] ...]: the rows of `a` with right-hand sides `b`, orthonormalized
+  by modified Gram-Schmidt run twice (the rows' span, d carried along).
+  A row that is a combination of earlier ones is dropped when its
+  right-hand side agrees with theirs; throws when it does not."
+  [a b]
+  (reduce (fn [qs [row c]]
+            (let [r (double-array row)
+                  n0 (Math/sqrt (areduce r i s 0.0 (+ s (* (aget r i) (aget r i)))))
+                  c0 (Math/abs (double c))
+                  c (loop [pass 0 c (double c)]
+                      (if (= pass 2)
+                        c
+                        (recur (inc pass)
+                               (reduce (fn [c [^doubles q d]]
+                                         (let [k (areduce r i s 0.0 (+ s (* (aget r i) (aget q i))))]
+                                           (dotimes [i (alength r)] (aset r i (- (aget r i) (* k (aget q i)))))
+                                           (- c (* k (double d)))))
+                                       c qs))))
+                  nr (Math/sqrt (areduce r i s 0.0 (+ s (* (aget r i) (aget r i)))))]
+              (if (<= nr (* 1e-10 n0))
+                (if (<= (Math/abs c) (* 1e-8 (max 1.0 c0 n0)))
+                  qs
+                  (throw (ex-info "augur.enkf/project: contradictory constraints" {:residual c})))
+                (do (dotimes [i (alength r)] (aset r i (/ (aget r i) nr)))
+                    (conj qs [r (/ c nr)])))))
+          [] (map vector a b)))
+
+(defn project
+  "The point nearest `x` (Euclidean) on {x : A x = b}, `a` the rows of A:
+  x - A'(A A')^+ (A x - b), rows that repeat others allowed (Simon & Chia
+  2002's projection of a Kalman estimate onto equality constraints)."
+  [x a b]
+  (let [qs (orthonormal a b)
+        x (double-array x)]
+    (doseq [[^doubles q d] qs]
+      (let [k (- (areduce q i s 0.0 (+ s (* (aget q i) (aget x i)))) (double d))]
+        (dotimes [i (alength x)] (aset x i (- (aget x i) (* k (aget q i)))))))
+    (vec x)))
+
+(defn update-constrained
+  "update, then each member projected onto its linear constraints {:a rows
+  :b right-hand side} or {:a :b-of (fn [member index]) -> b}: identities
+  every member holds stay held exactly, as the update alone keeps them
+  only to rounding, and only when every member's b is the same."
+  [ens h y r g {:keys [a b b-of]}]
+  (let [post (update ens h y r g)]
+    (if b
+      (let [qs (orthonormal a b)]
+        (mapv (fn [x] (let [x (double-array x)]
+                        (doseq [[^doubles q d] qs]
+                          (let [k (- (areduce q i s 0.0 (+ s (* (aget q i) (aget x i)))) (double d))]
+                            (dotimes [i (alength x)] (aset x i (- (aget x i) (* k (aget q i)))))))
+                        (vec x)))
+              post))
+      (vec (map-indexed (fn [i x] (project x a (b-of i))) post)))))
