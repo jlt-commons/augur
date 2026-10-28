@@ -98,3 +98,12 @@
         fast (e/update-constrained ens (fn [x] [(nth x 3)]) [0.5] [0.1] g1 {:a a :b-of b-of})
         slow (map-indexed (fn [i x] (e/project x a (b-of i))) (e/update ens (fn [x] [(nth x 3)]) [0.5] [0.1] g2))]
     (is (every? true? (map (fn [x y] (every? #(< (Math/abs %) 1e-12) (map - x y))) fast slow)))))
+
+(deftest an-observation-against-each-members-own-scale
+  ;; members observe x / s_i = 2 with s_i their own scale (not in the
+  ;; state), linear as x - 2 s_i = 0
+  (let [g (m/rng 11)
+        s (vec (for [i (range 400)] (+ 1.0 (* 0.01 (mod i 7)))))
+        ens (vec (for [_ (range 400)] [(+ 1.0 (* 0.5 (m/normal! g)))]))
+        post (e/update ens (fn [x i] [(- (first x) (* 2.0 (s i)))]) [0.0] [1e-4] g {:indexed true})]
+    (is (< (mean (map (fn [x i] (Math/abs (- (/ (first x) (s i)) 2.0))) post (range))) 0.05))))

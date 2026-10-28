@@ -53,15 +53,19 @@
   them, finite and positive), each member's predicted observation (h
   member) (k values): each member moves by C_xh (C_hh + R)^-1 (y + e - h),
   e its centred perturbation; `g` an augur.math rng. A vector of n state
-  vectors."
-  [ens h y r g]
+  vectors. opts :indexed, h called (h member i) with the member's index:
+  an observation of a member's state against something of its own not in
+  the state (a level observed as a ratio to the member's output), kept
+  linear in the state."
+  ([ens h y r g] (update ens h y r g {}))
+  ([ens h y r g {:keys [indexed]}]
   (let [n (count ens) k (count y)]
     (when (< n 2) (throw (ex-info "augur.enkf/update: two members or more" {:n n})))
     (when (not= k (count r)) (throw (ex-info "augur.enkf/update: one variance per observation" {:y k :r (count r)})))
     (when-not (every? #(and (finite? %) (pos? (double %))) r)
       (throw (ex-info "augur.enkf/update: variances finite and positive" {:r r})))
     (when-not (apply = (map count ens)) (throw (ex-info "augur.enkf/update: members of one length" {})))
-    (let [hs (mapv #(vec (h %)) ens)]
+    (let [hs (if indexed (vec (map-indexed (fn [i x] (vec (h x i))) ens)) (mapv #(vec (h %)) ens))]
       (when-not (every? #(= k (count %)) hs) (throw (ex-info "augur.enkf/update: h gives one value per observation" {})))
       (when-not (every? #(every? finite? %) (concat ens hs))
         (throw (ex-info "augur.enkf/update: a member or its prediction is not finite" {})))
@@ -84,7 +88,7 @@
                       w (solve-chol l innov k)]
                   (mapv (fn [a xa] (+ xa (loop [j 0 acc 0.0] (if (< j k) (recur (inc j) (+ acc (* (aget ^doubles (cxh a) j) (aget w j)))) acc))))
                         (range dim) x)))
-              ens hs raw)))))
+              ens hs raw))))))
 
 ;; -- linear equality constraints ---------------------------------------------------
 
@@ -143,7 +147,7 @@
   :b right-hand side} or {:a :b-of (fn [member index]) -> b}: identities
   every member holds stay held exactly, as the update alone keeps them
   only to rounding, and only when every member's b is the same."
-  [ens h y r g {:keys [a b b-of]}]
-  (let [post (update ens h y r g)
+  [ens h y r g {:keys [a b b-of indexed]}]
+  (let [post (update ens h y r g {:indexed indexed})
         p (projector a)]
     (vec (map-indexed (fn [i x] (p x (if b b (b-of i)))) post))))
