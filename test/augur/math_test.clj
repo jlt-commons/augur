@@ -47,3 +47,67 @@
     (is (= x (m/next-double! (m/rng 9))) "the first draw is the array generator's")
     (is (= [x y] (let [g (m/rng 9)] [(m/next-double! g) (m/next-double! g)])) "and so is the next")
     (is (= x (first (m/with-rng st m/next-double!))) "the same state, the same draw")))
+
+;; --- seeds: rng fills its state linearly, seed-of mixes -------------------------------
+
+(defn- corr [xs ys]
+  (let [n (double (count xs))
+        mx (/ (reduce + xs) n) my (/ (reduce + ys) n)
+        sxy (reduce + (map #(* (- %1 mx) (- %2 my)) xs ys))
+        sxx (reduce + (map #(* (- % mx) (- % mx)) xs))
+        syy (reduce + (map #(* (- % my) (- % my)) ys))]
+    (/ sxy (Math/sqrt (* sxx syy)))))
+
+(defn- draws
+  "The draws at indices `ds` of a generator: one vector per stream."
+  [g ds]
+  (let [top (inc (apply max ds))
+        xs (vec (repeatedly top #(m/next-double! g)))]
+    (mapv xs ds)))
+
+(defn- neighbour-corrs
+  "For streams (make s) over seeds s = 1, 1+step, ..., n of them: the
+  correlation at each draw index in `ds` between each stream and the next."
+  [make step n ds]
+  (let [rows (mapv #(draws (make (inc (* % step))) ds) (range (inc n)))]
+    (mapv (fn [j] (corr (mapv #(nth % j) (pop rows)) (mapv #(nth % j) (rest rows))))
+          (range (count ds)))))
+
+(def ^:private ds [0 1 2 3 44 1000])
+
+(deftest rng-output-is-unchanged
+  (is (= [2.0 12345.0 2.0 7933.0 12345.0 7933.0] (vec (m/rng 1))))
+  (doseq [[s xs] {1 [0.5909521507374121 0.7664460862103818 0.23130270864604122]
+                  42 [0.308585652426308 0.38708519994135054 0.21204070143971265]
+                  7919 [0.8643826751018867 0.45536875834611756 0.17058563336772187]
+                  123456789 [0.3131982866081511 0.5076614864155625 0.31800836560915696]}]
+    (let [g (m/rng s)] (is (= xs (vec (repeatedly 3 #(m/next-double! g)))) s))))
+
+(deftest rng-streams-from-evenly-spaced-seeds-are-correlated
+  ;; the defect seed-of exists for: kept as a record of why
+  (is (some #(> (Math/abs %) 0.3) (neighbour-corrs m/rng 1 2000 ds)))
+  (is (some #(> (Math/abs %) 0.3) (neighbour-corrs m/rng 7919 2000 ds))))
+
+(deftest seed-of-is-splitmix64
+  ;; the same values bnm.sfc-analysis/seed-of gave, so its runs do not move
+  (is (= -2152535657050944081 (m/seed-of 0)) "SplitMix64's first output from state 0")
+  (is (= [-7995527694508729151 -4838594755968170389 -5182195735961227806 -8278551758858648694 2173552090174352397]
+         [(m/seed-of 1) (m/seed-of 1 2) (m/seed-of 1 2 1) (m/seed-of 7919 0) (m/seed-of -5 3)]))
+  (is (not= (m/seed-of 1 2) (m/seed-of 2 1)) "the keys are ordered"))
+
+(deftest rng-mixed-is-rng-of-seed-of
+  (is (= (vec (m/rng (m/seed-of 3 4))) (vec (m/rng-mixed 3 4))))
+  (is (= (vec (m/rng (m/seed-of 3))) (vec (m/rng-mixed 3)))))
+
+(deftest mixed-streams-from-evenly-spaced-seeds-are-uncorrelated
+  (doseq [step [1 2 7919 1000003]
+          r (neighbour-corrs m/rng-mixed step 4000 ds)]
+    (is (< (Math/abs r) 0.05) [step r])))
+
+(deftest mixed-streams-by-index-are-uncorrelated
+  ;; one seed, stream index i = 0, 1, 2, ...: neighbouring streams, and the
+  ;; same stream index under neighbouring seeds
+  (doseq [r (neighbour-corrs #(m/rng-mixed 17 %) 1 4000 ds)]
+    (is (< (Math/abs r) 0.05) [:index r]))
+  (doseq [r (neighbour-corrs #(m/rng-mixed % 5) 1 4000 ds)]
+    (is (< (Math/abs r) 0.05) [:seed r])))

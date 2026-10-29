@@ -68,7 +68,10 @@ out as its own library.
 - **Pure functions over values.** No IO, clock, logging or atoms. Time is an
   argument. The generator is a value: `augur.math/rng-state` gives a vector
   of six doubles and `with-rng` returns a draw with the state after it, so
-  the same state gives the same draw.
+  the same state gives the same draw. `rng` fills its state linearly from
+  the seed, so seeds a fixed step apart give correlated streams; seed
+  several streams with `rng-mixed` (or `rng` of `seed-of`, a SplitMix64 hash
+  of a seed and stream keys).
 - **Numbers are arguments.** Priors, forgetting rates, shrinkage, strengths,
   bin edges and thresholds are passed in, and a function that needs one
   throws if it is missing. A namespace's `defaults` map records the values

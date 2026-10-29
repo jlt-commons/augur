@@ -55,12 +55,40 @@
 ;; generator on 64-bit integers.
 
 (defn rng
-  "A generator seeded with `seed`: a six-slot mutable state."
+  "A generator seeded with `seed`: a six-slot mutable state.
+
+  The state is filled linearly from the seed, and the recurrence is
+  linear, so draw d of the stream for seed s + k is draw d for seed s
+  shifted by a constant that depends on k and d alone. Streams from seeds
+  a fixed step apart (s, s + 1, ... or s + 7919 i) are therefore
+  correlated at each draw index, by up to 0.9. One stream is fine; for
+  several streams that are compared draw by draw, seed them with
+  `rng-mixed` (or `seed-of`). Kept as it is so seeded runs replay."
   [seed]
   (let [seed (Math/abs (long seed))
         a (double (inc (mod seed 4294967086)))
         b (double (inc (mod (+ (* (mod seed 1000003) 7919) 13) 4294944442)))]
     (double-array [a 12345.0 a b 12345.0 b])))
+
+;; SplitMix64's finaliser (Steele, Lea and Flood 2014), as constants that fit a long
+(defn- splitmix ^long [^long x]
+  (let [z (unchecked-add x (unchecked-long -7046029254386353131))
+        z (unchecked-multiply (bit-xor z (unsigned-bit-shift-right z 30)) (unchecked-long -4658895280553007687))
+        z (unchecked-multiply (bit-xor z (unsigned-bit-shift-right z 27)) (unchecked-long -7723592293110705685))]
+    (bit-xor z (unsigned-bit-shift-right z 31))))
+
+(defn seed-of
+  "A seed for `rng` from `seed` and the keys `ks` (whole numbers, say a
+  stream's index), mixed by SplitMix64's finaliser: each key xored into
+  the hash so far and mixed again, so the keys are ordered. Streams from
+  neighbouring or evenly spaced seeds, or keys, are uncorrelated."
+  [seed & ks]
+  (reduce (fn [h k] (splitmix (bit-xor (long h) (long k)))) (splitmix (long seed)) ks))
+
+(defn rng-mixed
+  "A generator seeded with (seed-of seed ks...): `rng` for several streams."
+  [seed & ks]
+  (rng (apply seed-of seed ks)))
 
 (defn next-double!
   "A uniform double in (0, 1) from generator `g`, advancing it."
