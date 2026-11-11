@@ -40,8 +40,12 @@
   depend on units. Damped Newton steps, each halved until the penalized
   likelihood improves, until they are small or :iterations (default 25) have
   run. :start gives coefficients to start from; :penalties, one multiplier
-  of :prior per coefficient (`fit-shrunk`)."
-  ^doubles [rows ^long k {:keys [prior start iterations penalties] :or {iterations 25}}]
+  of :prior per coefficient (`fit-shrunk`); :raw, a set of coefficient
+  indices whose prior precision is on the input's own scale instead, as for
+  an indicator: standardized, a pattern on in a handful of rows has a tiny
+  spread, so a weak prior, and those rows alone set its coefficient; on its
+  own scale the prior holds it near zero until outcomes accumulate."
+  ^doubles [rows ^long k {:keys [prior start iterations penalties raw] :or {iterations 25}}]
   (when-not prior (throw (ex-info "augur.logit/fit needs :prior" {})))
   (let [start (some-> start ->array)
         rows (vec rows)
@@ -85,6 +89,9 @@
         ;; :penalties scales each coefficient's precision (on the
         ;; standardized scale); the intercept stays nearly free
         ^doubles pen (double-array (if penalties (map #(* prior (double %)) penalties) (repeat k prior)))
+        ;; b = beta * sd, so a precision P on beta is P / sd^2 on b
+        _ (doseq [j raw :when (< 0 (long j) k)]
+            (aset pen (long j) (/ (aget pen (long j)) (let [s (aget sd (long j))] (* s s)))))
         _ (aset pen 0 1e-4)
         eta (fn ^double [^doubles bb ^long r]
               (let [o (* r k)]

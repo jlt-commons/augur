@@ -56,6 +56,32 @@
     (is (< (Math/abs (- 1.2 (aget hs 1))) (Math/abs (- 1.2 (aget ridge 1)))))
     (is (<= (noise hs) (* 1.05 (noise ridge))) "the noise no less shrunk")))
 
+(deftest raw-scale-priors-for-rare-patterns
+  ;; an indicator on in a handful of rows, all of them onsets: standardized,
+  ;; its prior weakens with its spread and the few rows set it; on its own
+  ;; scale the prior holds it near zero until outcomes accumulate
+  (let [rows (fn [n-on]
+               (vec (for [i (range 4000)]
+                      (let [on? (< i n-on)]
+                        {:x (double-array [1.0 (if on? 1.0 0.0)]) :y (or on? (< (mod i 50) 1)) :w 1.0}))))
+        few (rows 3)
+        std (logit/fit few 2 {:prior 10.0})
+        raw (logit/fit few 2 {:prior 10.0 :raw #{1}})]
+    (is (> (aget std 1) 2.0) (vec std))
+    (is (< (Math/abs (aget raw 1)) 0.4) (vec raw))
+    (testing "a pattern never on in the rows moves nothing either way"
+      (let [none (rows 0)]
+        (is (== 0.0 (aget (logit/fit none 2 {:prior 10.0 :raw #{1}}) 1)))
+        (is (== 0.0 (aget (logit/fit none 2 {:prior 10.0}) 1)))))
+    (testing "with many rows the data win on either scale"
+      (let [many (rows 1500)]
+        (is (> (aget (logit/fit many 2 {:prior 10.0 :raw #{1}}) 1) 3.0))))
+    (testing "the intercept and the other inputs are as before"
+      (let [rows3 (mapv (fn [r i] (update r :x #(double-array (concat % [(Math/sin i)])))) (synthetic 2000 9) (range))
+            a (logit/fit rows3 4 {:prior 10.0})
+            b (logit/fit rows3 4 {:prior 10.0 :raw #{}})]
+        (is (= (vec a) (vec b)))))))
+
 (deftest coefficients-store-as-edn
   (let [rows (synthetic 400 3)
         beta (logit/fit rows 3 {:prior 1.0})
