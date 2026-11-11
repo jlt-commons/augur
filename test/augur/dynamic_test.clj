@@ -430,3 +430,16 @@
           rms (fn [xs] (Math/sqrt (/ (reduce + (map #(* % %) (drop 100 xs))) 100.0)))]
       (is (< (rms held) (* 0.5 (rms drift))) [(rms held) (rms drift)])))
   (is (thrown? clojure.lang.ExceptionInfo (d/logistic {:mean [0] :var [1] :discount 1.0 :hold [3]}))))
+
+(deftest a-held-or-pooled-model-s-mean-is-x-m
+  ;; the discount widens the coefficients' covariance, never their means:
+  ;; the predictive mean is x'm whether some coefficients are held or not
+  (let [x [1.0 1.0]
+        plain (d/logistic {:mean [1.0 1.0] :var [1 1] :discount 0.5})
+        held (d/logistic {:mean [1.0 1.0] :var [1 1] :discount 0.5 :hold [1]})
+        pooled (d/logistic {:mean [1.0 1.0 0.0] :var [1 1 1] :discount 0.5 :by {:index 2 :groups 2 :slopes [1] :tau 0.1}})]
+    (is (< (Math/abs (- 2.0 (:f (d/predictive plain x)))) 1e-12))
+    (is (< (Math/abs (- 2.0 (:f (d/predictive held x)))) 1e-12) (:f (d/predictive held x)))
+    (is (< (Math/abs (- 2.0 (:f (d/predictive pooled [1.0 1.0 0])))) 1e-12) (:f (d/predictive pooled [1.0 1.0 0])))
+    (testing "the variance: the discounted part widened, the held not"
+      (is (< (Math/abs (- 3.0 (:q (d/predictive held x)))) 1e-12) (:q (d/predictive held x))))))

@@ -129,7 +129,8 @@
   [^doubles mm ^doubles c ^long k ^doubles x ^double offset ^double scale sv]
   (let [x0 x
         x (if sv (let [^doubles sv sv o (double-array k)] (dotimes [i k] (aset o i (* (aget x i) (aget sv i)))) o) x)
-        f (loop [i 0 acc offset] (if (< i k) (recur (inc i) (+ acc (* (aget mm i) (aget x i)))) acc))
+        ;; the mean from the inputs themselves: sv scales the covariance only
+        f (loop [i 0 acc offset] (if (< i k) (recur (inc i) (+ acc (* (aget mm i) (aget ^doubles x0 i)))) acc))
         q (loop [i 0 acc 0.0]
             (if (< i k)
               (recur (inc i) (loop [j 0 acc acc]
