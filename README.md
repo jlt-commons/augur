@@ -16,8 +16,8 @@ out as its own library.
 ```clojure
 ;; deps.edn
 {:deps {io.github.jlt-commons/augur {:git/url "https://github.com/jlt-commons/augur"
-                                     :git/tag "v0.15.0"
-                                     :git/sha "f5c21eaa14e43453bbfb8a0be2d734127a779169"}}}
+                                     :git/tag "v0.16.0"
+                                     :git/sha "2a96345eb7a0895238de6d369b6e58795d00b828"}}}
 ```
 
 ```clojure
