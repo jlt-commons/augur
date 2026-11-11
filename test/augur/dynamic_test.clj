@@ -270,3 +270,88 @@
         avg (d/step (d/averaged {:a (mk) :b other} {:forget 1.0}) rows)
         expect (/ 1.0 (+ 1.0 (Math/exp (- other-ll seq-ll))))]
     (is (< (Math/abs (- (get (d/weights avg) :a) (+ (* (- 1.0 1e-6) expect) 0.5e-6))) 1e-9))))
+
+;; --- slopes pooled across groups of places (partial pooling) -------------
+
+(defn- grouped-rows
+  "n rows per group, x = [1 z1 z2 g], the outcome from intercept a and
+  group g's slopes (slopes g)."
+  [g n a slopes]
+  (vec (for [grp (range (count slopes)) _ (range n)]
+         (let [z1 (m/normal! g) z2 (m/normal! g)
+               [b1 b2] (slopes grp)
+               eta (+ a (* b1 z1) (* b2 z2))]
+           {:x [1.0 z1 z2 (double grp)] :y (< (m/next-double! g) (m/expit eta))}))))
+
+(defn- pooled-model [tau]
+  (d/logistic {:mean [0 0 0] :var [4 1 1] :discount 1.0 :inputs [0 1 2]
+               :by {:index 3 :groups 2 :slopes [1 2] :tau tau}}))
+
+(deftest opposite-slopes-in-two-groups-are-recovered
+  ;; a slope of +1 in one region and -1 in the other: one pooled slope
+  ;; averages them to zero, slopes by group recover both
+  (let [g (m/rng-mixed 21)
+        periods (repeatedly 40 #(grouped-rows g 25 -1.0 [[1.0 0.0] [-1.0 0.0]]))
+        one (run (d/logistic {:mean [0 0 0] :var [4 1 1] :discount 1.0 :inputs [0 1 2]}) periods)
+        by (run (pooled-model 1.0) periods)
+        [s0 s1] (d/slopes by)]
+    (is (< (Math/abs (second (d/means one))) 0.2) "pooled: the slopes cancel")
+    (is (< (Math/abs (- (first s0) 1.0)) 0.25) s0)
+    (is (< (Math/abs (- (first s1) -1.0)) 0.25) s1)
+    (is (< (Math/abs (second s0)) 0.2) "the irrelevant input stays near zero")
+    (testing "the forecast reads its own group's slope"
+      (is (> (d/predict by [1.0 2.0 0.0 0.0]) (+ 0.2 (d/predict by [1.0 2.0 0.0 1.0])))))))
+
+(deftest a-common-slope-is-pooled
+  ;; one slope everywhere; a group with few rows borrows from the one with
+  ;; many, so its slope is better known than on its own
+  (let [g (m/rng-mixed 22)
+        periods (vec (for [_ (range 30)]
+                       (let [many (grouped-rows g 40 -1.0 [[1.0 0.0] [1.0 0.0]])]
+                         ;; group 1 keeps 2 rows a period
+                         (into (filterv #(zero? (nth (:x %) 3)) many)
+                               (take 2 (filter #(= 1.0 (nth (:x %) 3)) many))))))
+        alone (run (d/logistic {:mean [0 0 0] :var [4 1 1] :discount 1.0 :inputs [0 1 2]})
+                   (map (fn [p] (filterv #(= 1.0 (nth (:x %) 3)) p)) periods))
+        by (run (pooled-model 0.1) periods)
+        [_ s1] (d/slopes by)]
+    (is (< (Math/abs (- (first s1) 1.0)) 0.15) s1)
+    (is (< (Math/abs (- (first s1) 1.0)) (Math/abs (- (second (d/means alone)) 1.0)))
+        "closer than the group on its own")))
+
+(deftest averaging-over-tau-learns-how-much-to-pool
+  ;; models at several tau, averaged: a small tau wins where the slopes are
+  ;; common, a large one where they differ
+  (let [avg #(d/averaged {:t0 (pooled-model 0.02) :t1 (pooled-model 1.0)} {:forget 1.0})
+        common (let [g (m/rng-mixed 23)] (run (avg) (repeatedly 40 #(grouped-rows g 25 -1.0 [[1.0 0.0] [1.0 0.0]]))))
+        apart (let [g (m/rng-mixed 24)] (run (avg) (repeatedly 40 #(grouped-rows g 25 -1.0 [[1.0 0.0] [-1.0 0.0]]))))]
+    (is (> (:t0 (d/weights common)) 0.5) (d/weights common))
+    (is (> (:t1 (d/weights apart)) 0.99) (d/weights apart))))
+
+(deftest an-irrelevant-covariate-shrinks-to-zero
+  ;; an input with no effect in any group: its common slope and every
+  ;; group's stay near zero, nearer than separate unpooled models' and
+  ;; held there by the deviations' prior
+  (let [g (m/rng-mixed 25)
+        periods (repeatedly 30 #(grouped-rows g 8 -1.0 [[0.0 0.0] [0.0 0.0]]))
+        by (run (pooled-model 0.05) periods)
+        sep (fn [grp] (second (d/means (run (d/logistic {:mean [0 0 0] :var [4 1 1] :discount 1.0 :inputs [0 1 2]})
+                                            (map (fn [p] (filterv #(= (double grp) (nth (:x %) 3)) p)) periods)))))]
+    (doseq [s (d/slopes by)]
+      (is (< (Math/abs (first s)) 0.12) s))
+    (is (< (reduce + (map #(Math/abs (first %)) (d/slopes by))) (+ (Math/abs (sep 0)) (Math/abs (sep 1))))))
+  (testing "the deviations are held, not discounted: pooling does not dissolve"
+    (let [st (d/step (d/logistic {:mean [0 0] :var [4 1] :discount 0.5 :inputs [0 1]
+                                  :by {:index 2 :groups 2 :slopes [1] :tau 0.1}})
+                     [])
+          ^doubles c (:c st)
+          k (:k st)]
+      (is (= 4 k) "intercept, one common slope, a deviation per group")
+      (is (< (Math/abs (- (aget c 0) 8.0)) 1e-12) "the common part discounted")
+      (is (< (Math/abs (- (aget c (+ (* 2 k) 2)) 0.01)) 1e-12) "a deviation held at tau^2"))))
+
+(deftest pooled-slopes-need-a-group-in-range
+  (is (thrown? clojure.lang.ExceptionInfo
+               (d/predict (pooled-model 0.1) [1.0 0.0 0.0 2.0])))
+  (is (thrown? clojure.lang.ExceptionInfo
+               (d/logistic {:mean [0 0] :var [1 1] :discount 1.0 :by {:index 2 :groups 2 :slopes [5] :tau 0.1}}))))

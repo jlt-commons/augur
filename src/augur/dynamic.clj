@@ -42,15 +42,37 @@
   (when-let [missing (seq (keep (fn [[k v]] (when (nil? v) k)) opts))]
     (throw (ex-info (str "augur.dynamic/" (name f) " needs " (vec missing)) {:missing (vec missing)}))))
 
-(defn- model [kind {:keys [mean var discount inputs] :as opts}]
+(defn- by-layout
+  "The pooled-slopes layout of a model of k coefficients: {:index :groups
+  :slopes :tau :base k}, checked."
+  [k {:keys [index groups slopes tau] :as by}]
+  (need :by {:index index :groups groups :slopes slopes :tau tau})
+  (let [slopes (vec slopes)
+        taus (if (number? tau) (vec (repeat (count slopes) (double tau))) (mapv double tau))]
+    (when-not (and (pos? (long groups)) (seq slopes) (every? #(< -1 (long %) k) slopes)
+                   (= (count taus) (count slopes)) (every? pos? taus))
+      (throw (ex-info "augur.dynamic: :by needs groups > 0, slopes among the model's coefficients and a positive tau each" by)))
+    {:index (long index) :groups (long groups) :slopes slopes :tau taus :base k}))
+
+(defn- model [kind {:keys [mean var discount inputs by] :as opts}]
   (need kind {:mean mean :var var :discount discount})
   (when (not= (count mean) (count var))
     (throw (ex-info (str "augur.dynamic/" (name kind) " needs one variance per mean") opts)))
-  (let [k (count mean)
+  (let [k0 (count mean)
+        by (some->> by (by-layout k0))
+        ;; pooled slopes: each group's deviation from the common slope, N(0, tau^2)
+        devs (when by (for [_ (range (:groups by)) t (:tau by)] t))
+        mean (concat (map double mean) (map (constantly 0.0) devs))
+        var (concat (map double var) (map #(* % %) devs))
+        k (count mean)
         c (double-array (* k k))]
     (dotimes [i k] (aset c (+ (* i k) i) (double (nth var i))))
-    {:type kind :k k :m (double-array (map double mean)) :c c
-     :discount (double discount) :inputs (some-> inputs vec)}))
+    (cond-> {:type kind :k k :m (double-array mean) :c c
+             :discount (double discount) :inputs (some-> inputs vec)}
+      by (assoc :by by
+                ;; the common part is discounted, the deviations held: a
+                ;; discount on them would dissolve the pooling
+                :sv (double-array (for [i (range k)] (if (< i k0) (/ 1.0 (Math/sqrt (double discount))) 1.0)))))))
 
 (defn logistic
   "A dynamic logistic regression for binary outcomes. Options above."
@@ -80,18 +102,28 @@
     (throw (ex-info "augur.dynamic/linear needs a positive :s0 and :n0" {:s0 s0 :n0 n0})))
   (assoc (model :linear opts) :s (double s0) :n (double n0)))
 
-(defn- pick ^doubles [{:keys [inputs k]} x]
-  (let [out (double-array k)]
+(defn- pick ^doubles [{:keys [inputs k by]} x]
+  (let [k0 (if by (:base by) k)
+        out (double-array k)]
     (if inputs
-      (dotimes [j k] (aset out j (double (nth x (inputs j)))))
-      (dotimes [j k] (aset out j (double (nth x j)))))
+      (dotimes [j k0] (aset out j (double (nth x (inputs j)))))
+      (dotimes [j k0] (aset out j (double (nth x j)))))
+    (when by
+      (let [{:keys [index groups slopes]} by
+            g (nth x index)
+            g (when (number? g) (long g))]
+        (when-not (and g (< -1 g groups))
+          (throw (ex-info "augur.dynamic: a row's group is not one of the model's" {:group (nth x index) :groups groups})))
+        (let [from (+ k0 (* g (count slopes)))]
+          (dotimes [s (count slopes)] (aset out (+ from s) (aget out (long (slopes s))))))))
     out))
 
-(defn- moments
-  "f = x'm (plus the offset) and q = x'Cx, the prior of the linear
-  predictor, with C scaled by `scale`."
-  [^doubles mm ^doubles c ^long k ^doubles x ^double offset ^double scale]
-  (let [f (loop [i 0 acc offset] (if (< i k) (recur (inc i) (+ acc (* (aget mm i) (aget x i)))) acc))
+(defn- moments*
+  "As moments, with C's entry ij further scaled by sv_i sv_j when sv is given."
+  [^doubles mm ^doubles c ^long k ^doubles x ^double offset ^double scale sv]
+  (let [x0 x
+        x (if sv (let [^doubles sv sv o (double-array k)] (dotimes [i k] (aset o i (* (aget x i) (aget sv i)))) o) x)
+        f (loop [i 0 acc offset] (if (< i k) (recur (inc i) (+ acc (* (aget mm i) (aget x i)))) acc))
         q (loop [i 0 acc 0.0]
             (if (< i k)
               (recur (inc i) (loop [j 0 acc acc]
@@ -99,10 +131,34 @@
               acc))]
     [f (* scale q)]))
 
+(defn- moments
+  "f = x'm (plus the offset) and q = x'Cx, the prior of the linear
+  predictor, with C scaled by `scale`."
+  [^doubles mm ^doubles c ^long k ^doubles x ^double offset ^double scale]
+  (moments* mm c k x offset scale nil))
+
+(defn- ahead
+  "[f q]: the linear predictor's moments for the picked inputs x in the
+  coming period, the state's covariance discounted as `step` will."
+  [{:keys [m c k discount sv]} x offset]
+  (if sv
+    (moments* m c k x (double offset) 1.0 sv)
+    (moments m c k x (double offset) (/ 1.0 (double discount)))))
+
 (defn means "The coefficients' posterior means." [state] (vec (:m state)))
 
-(defn- predict-one ^double [{:keys [type m c k discount]} x offset]
-  (let [[f q] (moments m c k x (double (or offset 0.0)) (/ 1.0 discount))]
+(defn slopes
+  "A model with pooled slopes (:by): each group's slopes, the common part
+  plus the group's deviation, in the order of :slopes."
+  [{:keys [by] :as state}]
+  (let [{:keys [base groups] ss :slopes} by
+        mm (:m state)]
+    (vec (for [g (range groups)]
+           (vec (for [[i j] (map-indexed vector ss)]
+                  (+ (aget ^doubles mm (long j)) (aget ^doubles mm (+ base (* g (count ss)) i)))))))))
+
+(defn- predict-one ^double [{:keys [type] :as state} x offset]
+  (let [[f q] (ahead state x (double (or offset 0.0)))]
     (case type
       ;; the logistic-normal integral (MacKay 1992's probit approximation)
       :logistic (m/expit (/ f (Math/sqrt (+ 1.0 (/ (* Math/PI q) 8.0)))))
@@ -188,8 +244,8 @@
   ([state x offset]
    (if (= :averaged (:type state))
      (predictive-averaged state x offset)
-     (let [{:keys [m c k discount type s]} state
-           [f q] (moments m c k (pick state x) (double (or offset 0.0)) (/ 1.0 discount))]
+     (let [{:keys [type s]} state
+           [f q] (ahead state (pick state x) (double (or offset 0.0)))]
        (cond-> {:f f :q q} (= :linear type) (assoc :s s :n (:n state)))))))
 
 (defn- linear-log-density
@@ -246,9 +302,9 @@
                 (case (:type state)
                   :logistic (let [p (predict state x o)]
                               (* w (Math/log (Math/max 1e-300 (if (event? y) p (- 1.0 p))))))
-                  :poisson (let [[f q] (moments (:m state) (:c state) (:k state) (pick state x) o (/ 1.0 (:discount state)))]
+                  :poisson (let [[f q] (ahead state (pick state x) o)]
                              (* w (poisson-log-predictive f q (double y))))
-                  :linear (let [[f q] (moments (:m state) (:c state) (:k state) (pick state x) o (/ 1.0 (:discount state)))]
+                  :linear (let [[f q] (ahead state (pick state x) o)]
                             (* w (linear-log-density (double y) f (+ q (:s state)) (:n state)))))))))
 
 (defn- linear-step
@@ -281,10 +337,14 @@
             (recur (next rows) s' n' ll)))))))
 
 (defn- discounted [state]
-  (let [{:keys [k discount]} state
+  (let [{:keys [k discount sv]} state
+        k (long k)
         mm (aclone ^doubles (:m state))
         ^doubles c (aclone ^doubles (:c state))]
-    (dotimes [i (* k k)] (aset c i (/ (aget c i) discount)))
+    (if sv
+      (let [^doubles sv sv]
+        (dotimes [i k] (dotimes [j k] (aset c (+ (* i k) j) (* (aget c (+ (* i k) j)) (aget sv i) (aget sv j))))))
+      (dotimes [i (* k k)] (aset c i (/ (aget c i) discount))))
     [mm c]))
 
 (defn step
