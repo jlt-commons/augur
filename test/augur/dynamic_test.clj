@@ -431,6 +431,38 @@
       (is (< (rms held) (* 0.5 (rms drift))) [(rms held) (rms drift)])))
   (is (thrown? clojure.lang.ExceptionInfo (d/logistic {:mean [0] :var [1] :discount 1.0 :hold [3]}))))
 
+;; --- a prior on the models' weights ------------------------------------------
+
+(deftest weights-start-from-and-fade-toward-a-prior
+  (let [same {:a (d/logistic {:mean [0 0] :var [4 1] :discount 0.99 :inputs [0 1]})
+              :b (d/logistic {:mean [0 0] :var [4 1] :discount 0.99 :inputs [0 1]})
+              :c (d/logistic {:mean [0 0] :var [4 1] :discount 0.99 :inputs [0 1]})}
+        g (m/rng-mixed 51)
+        periods (vec (repeatedly 60 #(vec (for [_ (range 20)] (let [x [1.0 (m/normal! g)]] {:x x :y (< (m/next-double! g) 0.2)})))))
+        avg (d/averaged same {:forget 0.95 :prior {:a 0.6}})]
+    (is (< (Math/abs (- 0.6 (:a (d/weights avg)))) 1e-12) "the named share")
+    (is (< (Math/abs (- 0.2 (:b (d/weights avg)))) 1e-12) "the rest evenly")
+    (testing "models that fit alike stay at the prior, not at equal weights"
+      (let [end (run avg periods)]
+        (is (< (Math/abs (- 0.6 (:a (d/weights end)))) 1e-4) (d/weights end))))
+    (testing "without one, equal weights as before"
+      (is (= (d/weights (run (d/averaged same {:forget 0.95}) periods))
+             (d/weights (run (d/averaged same {:forget 0.95 :prior {}}) periods))))))
+  (testing "evidence still moves the weights off the prior"
+    (let [g (m/rng-mixed 52)
+          period (fn [] (vec (for [_ (range 40)]
+                               (let [x [1.0 (m/normal! g) (m/normal! g)]]
+                                 {:x x :y (< (m/next-double! g) (m/expit (+ -1.0 (* 2.0 (nth x 2)))))}))))
+          models {:first (d/logistic {:mean [0 0] :var [4 4] :discount 0.98 :inputs [0 1]})
+                  :second (d/logistic {:mean [0 0] :var [4 4] :discount 0.98 :inputs [0 2]})}
+          end (run (d/averaged models {:forget 0.99 :prior {:first 0.9}}) (repeatedly 40 period))]
+      (is (> (:second (d/weights end)) 0.8) (d/weights end))))
+  (is (thrown? clojure.lang.ExceptionInfo (d/averaged {:a (d/logistic {:mean [0] :var [1] :discount 1.0})} {:forget 1.0 :prior {:z 0.5}}))
+      "a prior on a model that is not there")
+  (is (thrown? clojure.lang.ExceptionInfo (d/averaged {:a (d/logistic {:mean [0] :var [1] :discount 1.0})
+                                                       :b (d/logistic {:mean [0] :var [1] :discount 1.0})} {:forget 1.0 :prior {:a 1.5}}))
+      "shares above one"))
+
 (deftest a-held-or-pooled-model-s-mean-is-x-m
   ;; the discount widens the coefficients' covariance, never their means:
   ;; the predictive mean is x'm whether some coefficients are held or not

@@ -389,9 +389,20 @@
   multiply a period's likelihoods over all its rows and select one model
   where several fit about as well; stacked weights blend them. Blending
   is not ignoring: a model whose forecasts only add noise keeps a share
-  of the weight and adds its noise to the average."
-  [models {:keys [forget weighting]}]
+  of the weight and adds its noise to the average.
+
+  :prior {name share} starts the weights from those shares instead of
+  equal ones, the models not named sharing the rest evenly, and the
+  forgetting flattens the weights toward them (w^forget prior^(1 -
+  forget)) rather than toward equal weights: where the models fit alike
+  the weights stay at the prior, and evidence moves them off it as
+  before."
+  [models {:keys [forget weighting prior]}]
   (need :averaged {:forget forget})
+  (when-let [bad (seq (remove (set (keys models)) (keys prior)))]
+    (throw (ex-info "augur.dynamic/averaged: :prior names a model that is not averaged" {:models (vec bad)})))
+  (when (or (some #(neg? (double %)) (vals prior)) (> (reduce + 0.0 (vals prior)) 1.000001))
+    (throw (ex-info "augur.dynamic/averaged: :prior's shares must be at least 0 and sum to at most 1" prior)))
   (when weighting
     (case (:rule weighting)
       :stack (need :averaged {:rate (:rate weighting) :floor (:floor weighting)})
@@ -404,6 +415,13 @@
       (throw (ex-info "augur.dynamic/averaged needs models of one kind" {:kinds kinds})))
     (cond-> {:type :averaged :kind (first kinds) :models models :forget (double forget)
              :w (into {} (for [k (keys models)] [k (/ 1.0 (count models))]))}
+      (seq prior) (as-> avg (let [named (reduce + 0.0 (map double (vals prior)))
+                                  others (- (count models) (count prior))
+                                  pi (into {} (for [k (keys models)]
+                                                [k (if (contains? prior k)
+                                                     (double (prior k))
+                                                     (/ (- 1.0 named) (double others)))]))]
+                              (assoc avg :prior pi :w pi)))
       weighting (assoc :weighting (if (= :stack (:rule weighting))
                                     {:rule :stack :rate (double (:rate weighting)) :floor (double (:floor weighting))}
                                     {:rule :temper :power (double (:power weighting))})))))
@@ -412,6 +430,16 @@
 
 (defn- predict-averaged [{:keys [models w]} x offset]
   (reduce + (for [[k mdl] models] (* (w k) (predict mdl x offset)))))
+
+(defn- flattened
+  "The weights `w` flattened by `forget`, toward the prior's shares when
+  there is one, else toward equal weights; normalized."
+  [w forget prior]
+  (let [flat (if prior
+               (into {} (for [[k v] w] [k (* (Math/pow v forget) (Math/pow (prior k) (- 1.0 forget)))]))
+               (into {} (for [[k v] w] [k (Math/pow v forget)])))
+        z (reduce + (vals flat))]
+    (update-vals flat #(/ % z))))
 
 (defn- stacked-weights
   "The weights after `rows` by exponentiated gradient on the mixture's log
@@ -437,17 +465,14 @@
 
 (defn- step-averaged [{:keys [models w forget weighting] :as avg} rows]
   (if (= :stack (:rule weighting))
-    (let [flat (into {} (for [[k v] w] [k (Math/pow v forget)]))
-          z (reduce + (vals flat))]
+    (let [flat (flattened w forget (:prior avg))]
       (assoc avg
-             :w (stacked-weights models (update-vals flat #(/ % z)) weighting rows)
+             :w (stacked-weights models flat weighting rows)
              :models (into {} (for [[k mdl] models] [k (step mdl rows)]))))
     (step-posterior avg rows)))
 
 (defn- step-posterior [{:keys [models w forget] :as avg} rows]
-  (let [flat (into {} (for [[k v] w] [k (Math/pow v forget)]))
-        z (reduce + (vals flat))
-        prior (update-vals flat #(/ % z))
+  (let [prior (flattened w forget (:prior avg))
         ;; each model's evidence: how likely it made the period's outcomes
         ;; a linear model's is exact and sequential: each row given the
         ;; ones before it (its step computes it)
