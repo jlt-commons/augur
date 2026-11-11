@@ -169,3 +169,49 @@
       (is (< (Math/abs (- (first (:tau2 loose)) (first (:tau2 free)))) 1e-3) [(:tau2 loose) (:tau2 free)])))
   (is (thrown? Exception (h/intercepts [{:path ["a"] :o 0.0 :y true :w 1.0}] {:tau2 [1.0 1.0] :sweeps 1 :sd-prior [1.0]}))
       "one scale per level"))
+
+;; --- grouped slopes ----------------------------------------------------------
+
+(defn- grouped-rows
+  "Rows of `n` per group, x = [1 x1 x2], the log odds -2 + b1 x1 + b2 x2
+  with each group's slopes from `slopes` (default the shared [1.5 -1.0])."
+  [seed groups n slopes]
+  (let [g (m/rng seed)]
+    (vec (for [grp groups _ (range n)
+               :let [[b1 b2] (get slopes grp [1.5 -1.0])
+                     x1 (m/normal! g) x2 (* 3.0 (m/normal! g))
+                     eta (+ -2.0 (* b1 x1) (* b2 (/ x2 3.0)))]]
+           {:x [1.0 x1 x2] :y (< (m/next-double! g) (m/expit eta)) :w 1.0 :g grp}))))
+
+(def gs-opts {:prior 1.0 :sd-prior [1.0 0.5 0.5] :tau2 [0.1 0.1 0.1] :sweeps 20})
+
+(deftest grouped-slopes-pool-a-shared-form
+  (let [fit (h/grouped-slopes (grouped-rows 7 ["a" "b" "c" "d" "e"] 600 {}) 3 gs-opts)
+        [_ b1 b2] (:beta fit)]
+    (testing "the pooled slopes are recovered on the inputs' own scale"
+      (is (< (Math/abs (- b1 1.5)) 0.2) b1)
+      (is (< (Math/abs (- b2 (/ -1.0 3.0))) 0.07) b2))
+    (testing "groups that share the form get small slope deviations"
+      (is (every? #(< (Math/abs (double %)) 0.25) (mapcat (comp rest val) (:dev fit))) (:dev fit))
+      (is (< (second (:tau2 fit)) 0.05) (:tau2 fit)))
+    (testing "a group never seen is scored by the pooled part"
+      (is (= (h/grouped-predict fit [1.0 0.5 1.0] "new") (h/grouped-predict fit [1.0 0.5 1.0] nil))))))
+
+(deftest grouped-slopes-let-one-group-differ
+  (let [fit (h/grouped-slopes (grouped-rows 11 ["a" "b" "c" "d" "e"] 600 {"e" [-1.5 -1.0]}) 3 gs-opts)
+        b1 (get-in fit [:beta 1])
+        dev-e (get-in fit [:dev "e" 1])
+        dev-a (get-in fit [:dev "a" 1])]
+    (testing "the group with the opposite slope gets a large negative deviation"
+      (is (< dev-e -1.5) dev-e)
+      (is (< dev-e (- (Math/abs (double dev-a)))) [dev-e dev-a]))
+    (testing "each group's own slope is recovered: the shared slope plus its deviation"
+      (is (< (Math/abs (- (+ b1 dev-e) -1.5)) 0.35) (+ b1 dev-e))
+      (is (< (Math/abs (- (+ b1 dev-a) 1.5)) 0.35) (+ b1 dev-a)))
+    (testing "its slope variance is estimated larger than the shared slope's"
+      (is (> (nth (:tau2 fit) 1) (nth (:tau2 fit) 2)) (:tau2 fit)))
+    (testing "its own predictions use its deviation"
+      (is (< (h/grouped-predict fit [1.0 2.0 0.0] "e") (h/grouped-predict fit [1.0 2.0 0.0] "a"))))))
+
+(deftest grouped-slopes-refuse-without-options
+  (is (thrown? Exception (h/grouped-slopes (grouped-rows 1 ["a"] 10 {}) 3 {:prior 1.0}))))

@@ -142,6 +142,202 @@
                                          (/ (* 2.0 ss s2) (+ (* m s2) (Math/sqrt (+ (* m m s2 s2) (* 4.0 ss s2))))))
                                        (/ ss m)))))))))))))))
 
+;; --- grouped slopes ---------------------------------------------------------
+
+(defn- cholesky!
+  "The lower Cholesky factor of the n x n row-major matrix `a`, in place of
+  a fresh array (pivots clamped as in augur.math/solve-spd)."
+  ^doubles [^doubles a ^long n]
+  (let [^doubles l (double-array (* n n))]
+    (dotimes [i n]
+      (dotimes [j (inc i)]
+        (let [s (loop [k 0 s (aget a (+ (* i n) j))]
+                  (if (< k j) (recur (inc k) (- s (* (aget l (+ (* i n) k)) (aget l (+ (* j n) k))))) s))]
+          (aset l (+ (* i n) j) (if (= i j) (Math/sqrt (Math/max s 1e-300)) (/ s (aget l (+ (* j n) j))))))))
+    l))
+
+(defn- chol-solve
+  "x with l l' x = b."
+  ^doubles [^doubles l ^doubles b ^long n]
+  (let [^doubles x (aclone b)]
+    (dotimes [i n]
+      (aset x i (/ (loop [k 0 s (aget x i)] (if (< k i) (recur (inc k) (- s (* (aget l (+ (* i n) k)) (aget x k)))) s))
+                   (aget l (+ (* i n) i)))))
+    (loop [i (dec n)]
+      (when (>= i 0)
+        (aset x i (/ (loop [k (inc i) s (aget x i)] (if (< k n) (recur (inc k) (- s (* (aget l (+ (* k n) i)) (aget x k)))) s))
+                     (aget l (+ (* i n) i))))
+        (recur (dec i))))
+    x))
+
+(defn- inverse-diagonal
+  "The diagonal entries `idx` of (l l')^-1: ||l^-1 e_i||^2, a forward solve
+  from i."
+  [^doubles l ^long n idx]
+  (into {} (for [i idx]
+             (let [^doubles y (double-array n)]
+               (aset y i (/ 1.0 (aget l (+ (* i n) i))))
+               (loop [r (inc i)]
+                 (when (< r n)
+                   (aset y r (/ (- (loop [k i s 0.0] (if (< k r) (recur (inc k) (+ s (* (aget l (+ (* r n) k)) (aget y k)))) s)))
+                                (aget l (+ (* r n) r))))
+                   (recur (inc r))))
+               [i (loop [r i s 0.0] (if (< r n) (recur (inc r) (+ s (* (aget y r) (aget y r)))) s))]))))
+
+(defn grouped-slopes
+  "A logistic model with slopes shared by every group and each group's
+  deviations from them, partially pooled: rows {:x [1 x1 ...] :y :w :g},
+  x of length k with x[0] the intercept's 1, g the row's group (nil: the
+  shared part only). log odds = sum_j (b_j + d_gj) x_j on inputs
+  standardized over the rows; b_0 free, b_j ~ N(0, 1/:prior), d_gj ~ N(0,
+  tau2_j), one variance per coefficient (the intercept's too) shared by
+  the groups. Newton steps on all coefficients at once (the Hessian has
+  one k x k block per group, so a row costs k^2), each halved until the
+  penalized likelihood improves; after each sweep each tau2_j is set by
+  the Laplace EM step, the mean over groups of d^2 plus its posterior
+  variance, made a posterior mode by a half-normal prior on tau_j of
+  scale (:sd-prior j) as `intercepts` does (Gelman 2006), so the data
+  say how far a group's form departs from the shared one. Options:
+  :prior, :tau2 (k starting variances), :sd-prior (k scales) and :sweeps
+  are required; :iterations (25) Newton steps a sweep. Returns {:beta [k]
+  :dev {g [k]} :tau2 [k] :groups [g ...]}, beta and dev on the inputs'
+  own scale (tau2 on the standardized one): a group's coefficients are
+  beta + its dev, and a group never seen takes beta (`grouped-predict`)."
+  [rows ^long k {:keys [prior tau2 sd-prior sweeps iterations] :or {iterations 25}}]
+  (when-not (and prior tau2 sd-prior sweeps)
+    (throw (ex-info "augur.hier/grouped-slopes needs :prior, :tau2, :sd-prior and :sweeps" {})))
+  (when-not (= k (count tau2) (count sd-prior))
+    (throw (ex-info "augur.hier/grouped-slopes needs one :tau2 and :sd-prior per coefficient" {:k k})))
+  (let [rows (vec rows)
+        n (count rows)
+        groups (vec (sort-by str (distinct (keep :g rows))))
+        G (count groups)
+        gi (into {} (map-indexed (fn [i g] [g i]) groups))
+        P (* k (inc G))
+        ^doubles z (double-array (* n k))
+        ^doubles ys (double-array n)
+        ^doubles ws (double-array n)
+        ^ints gs (int-array n)
+        ^doubles mean (double-array k) ^doubles sd (double-array k 1.0)
+        _ (dotimes [r n]
+            (let [{:keys [x y w g]} (rows r)]
+              (dotimes [j k] (aset z (+ (* r k) j) (double (nth x j))))
+              (aset ys r (if y 1.0 0.0))
+              (aset ws r (double (or w 1.0)))
+              (aset gs r (int (if (some? g) (gi g) -1)))))
+        wsum (Math/max 1e-12 (loop [r 0 a 0.0] (if (< r n) (recur (inc r) (+ a (aget ws r))) a)))
+        _ (dotimes [r n] (dotimes [j k] (aset mean j (+ (aget mean j) (* (aget ws r) (aget z (+ (* r k) j)))))))
+        _ (dotimes [j k] (aset mean j (/ (aget mean j) wsum)))
+        _ (let [^doubles v (double-array k)]
+            (dotimes [r n] (dotimes [j k] (let [d (- (aget z (+ (* r k) j)) (aget mean j))] (aset v j (+ (aget v j) (* (aget ws r) d d))))))
+            (dotimes [j k] (let [s (Math/sqrt (/ (aget v j) wsum))] (aset sd j (if (> s 1e-9) s 1.0)))))
+        _ (do (aset mean 0 0.0) (aset sd 0 1.0))
+        _ (dotimes [r n]
+            (aset z (* r k) 1.0)
+            (loop [j 1] (when (< j k) (aset z (+ (* r k) j) (/ (- (aget z (+ (* r k) j)) (aget mean j)) (aget sd j))) (recur (inc j)))))
+        ^doubles th (double-array P)
+        eta (fn ^double [^doubles t ^long r]
+              (let [o (* r k) g (aget gs r) go (* k (inc g))]
+                (loop [j 0 acc 0.0]
+                  (if (< j k)
+                    (recur (inc j) (+ acc (* (+ (aget t j) (if (>= g 0) (aget t (+ go j)) 0.0)) (aget z (+ o j)))))
+                    acc))))
+        pen-of (fn ^doubles [tau2]
+                 (let [^doubles p (double-array P)]
+                   (aset p 0 1e-4)
+                   (loop [j 1] (when (< j k) (aset p j (double prior)) (recur (inc j))))
+                   (dotimes [g G] (dotimes [j k] (aset p (+ (* k (inc g)) j) (/ 1.0 (double (nth tau2 j))))))
+                   p))
+        objective (fn ^double [^doubles t ^doubles pen]
+                    (- (loop [r 0 acc 0.0]
+                         (if (< r n)
+                           (let [e (eta t r)] (recur (inc r) (+ acc (* (aget ws r) (- (* (aget ys r) e) (softplus e))))))
+                           acc))
+                       (* 0.5 (loop [i 0 acc 0.0] (if (< i P) (recur (inc i) (+ acc (* (aget pen i) (aget t i) (aget t i)))) acc)))))
+        ;; the penalized Hessian and gradient at t
+        hessian (fn [^doubles t ^doubles pen]
+                  (let [^doubles h (double-array (* P P))
+                        ^doubles grad (double-array P)
+                        blocks (vec (repeatedly (inc G) #(double-array (* k k))))
+                        rs (vec (repeatedly (inc G) #(double-array k)))]
+                    (dotimes [r n]
+                      (let [o (* r k) g (aget gs r)
+                            ^doubles s (blocks (inc g)) ^doubles rg (rs (inc g))
+                            p (m/expit (eta t r))
+                            w (aget ws r)
+                            res (* w (- (aget ys r) p))
+                            c (* w (Math/max 1e-9 (* p (- 1.0 p))))]
+                        (dotimes [i k]
+                          (let [zi (aget z (+ o i)) ci (* c zi) hi (* i k)]
+                            (aset rg i (+ (aget rg i) (* res zi)))
+                            (loop [j i] (when (< j k) (aset s (+ hi j) (+ (aget s (+ hi j)) (* ci (aget z (+ o j))))) (recur (inc j))))))))
+                    (doseq [^doubles s blocks]
+                      (dotimes [i k] (loop [j (inc i)] (when (< j k) (aset s (+ (* j k) i) (aget s (+ (* i k) j))) (recur (inc j))))))
+                    (dotimes [b (inc G)]
+                      (let [^doubles s (blocks b) ^doubles rg (rs b) g (dec b)]
+                        (dotimes [i k]
+                          (aset grad i (+ (aget grad i) (aget rg i)))
+                          (dotimes [j k] (aset h (+ (* i P) j) (+ (aget h (+ (* i P) j)) (aget s (+ (* i k) j))))))
+                        (when (>= g 0)
+                          (let [go (* k (inc g))]
+                            (dotimes [i k]
+                              (aset grad (+ go i) (+ (aget grad (+ go i)) (aget rg i)))
+                              (dotimes [j k]
+                                (let [v (aget s (+ (* i k) j))]
+                                  (aset h (+ (* (+ go i) P) (+ go j)) v)
+                                  (aset h (+ (* i P) (+ go j)) v)
+                                  (aset h (+ (* (+ go i) P) j) v))))))))
+                    (dotimes [i P]
+                      (aset grad i (- (aget grad i) (* (aget pen i) (aget t i))))
+                      (aset h (+ (* i P) i) (+ (aget h (+ (* i P) i)) (aget pen i))))
+                    [h grad]))
+        newton (fn [^doubles pen]
+                 (loop [it 0 obj (objective th pen)]
+                   (when (< it iterations)
+                     (let [[h grad] (hessian th pen)
+                           ^doubles step (chol-solve (cholesky! h P) grad P)
+                           [^doubles nt nobj] (loop [s 1.0 tries 0]
+                                                (let [^doubles c (double-array P)]
+                                                  (dotimes [i P] (aset c i (+ (aget th i) (* s (aget step i)))))
+                                                  (let [o (objective c pen)]
+                                                    (if (or (> o obj) (>= tries 30)) [c o] (recur (* 0.5 s) (inc tries))))))
+                           moved (loop [i 0 a 0.0] (if (< i P) (recur (inc i) (Math/max a (Math/abs (- (aget nt i) (aget th i))))) a))]
+                       (when (> nobj obj) (System/arraycopy nt 0 th 0 P))
+                       (when (and (> nobj obj) (> moved 1e-7)) (recur (inc it) nobj))))))
+        tau2 (loop [sweep 0 tau2 (mapv double tau2)]
+               (let [pen (pen-of tau2)]
+                 (newton pen)
+                 (if (or (>= sweep sweeps) (zero? G))
+                   tau2
+                   (let [[h _] (hessian th pen)
+                         l (cholesky! h P)
+                         vars (inverse-diagonal l P (for [g (range G) j (range k)] (+ (* k (inc g)) j)))
+                         tau2' (vec (for [j (range k)]
+                                      (let [ss (reduce + (for [g (range G) :let [i (+ (* k (inc g)) j)]]
+                                                           (+ (* (aget th i) (aget th i)) (double (vars i)))))
+                                            s2 (let [x (double (nth sd-prior j))] (* x x))
+                                            mm (double G)]
+                                        (max 1e-6 (/ (* 2.0 ss s2) (+ (* mm s2) (Math/sqrt (+ (* mm mm s2 s2) (* 4.0 ss s2)))))))))
+                         done (every? #(< (Math/abs (Math/log (/ (double (tau2' %)) (double (tau2 %))))) 1e-3) (range k))]
+                     (if done
+                       (do (newton (pen-of tau2')) tau2')
+                       (recur (inc sweep) tau2'))))))
+        unscale (fn [^doubles t off]
+                  (let [b (vec (for [j (range k)] (if (zero? j) 0.0 (/ (aget t (+ off j)) (aget sd j)))))]
+                    (assoc b 0 (- (aget t off) (reduce + (map #(* (b %) (aget mean %)) (range 1 k)))))))]
+    {:beta (unscale th 0)
+     :dev (into {} (for [g groups] [g (unscale th (* k (inc (gi g))))]))
+     :tau2 tau2
+     :groups groups}))
+
+(defn grouped-predict
+  "The probability for inputs x (x[0] the intercept's 1) under a
+  `grouped-slopes` fit for group g: beta plus g's deviations, beta alone
+  for a group the fit never saw (or nil)."
+  ^double [fit x g]
+  (let [b (:beta fit) d (get-in fit [:dev g])]
+    (m/expit (reduce + 0.0 (map-indexed (fn [j xj] (* (double xj) (+ (double (b j)) (if d (double (d j)) 0.0)))) x)))))
+
 ;; --- dynamic states --------------------------------------------------------
 
 (defn- stationary ^double [^double rho ^double q] (/ q (max 1e-12 (- 1.0 (* rho rho)))))
