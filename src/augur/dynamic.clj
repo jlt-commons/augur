@@ -54,8 +54,14 @@
       (throw (ex-info "augur.dynamic: :by needs groups > 0, slopes among the model's coefficients and a positive tau each" by)))
     {:index (long index) :groups (long groups) :slopes slopes :tau taus :base k}))
 
-(defn- model [kind {:keys [mean var discount inputs by hold] :as opts}]
+(defn- model [kind {:keys [mean var discount inputs by hold group-shrink] :as opts}]
   (need kind {:mean mean :var var :discount discount})
+  (when group-shrink
+    (let [{:keys [groups tau rate]} group-shrink]
+      (when-not (and (number? tau) (pos? (double tau))
+                     (every? (fn [g] (and (seq g) (every? #(< -1 (long %) (count mean)) g))) groups)
+                     (or (nil? rate) (< 0.0 (double rate) 1.000001)))
+        (throw (ex-info (str "augur.dynamic/" (name kind) ": :group-shrink needs a positive :tau, groups of the model's coefficients and a :rate in (0, 1]") group-shrink)))))
   (when (not= (count mean) (count var))
     (throw (ex-info (str "augur.dynamic/" (name kind) " needs one variance per mean") opts)))
   (when-not (every? #(< -1 (long %) (count mean)) hold)
@@ -72,6 +78,9 @@
     (cond-> {:type kind :k k :m (double-array mean) :c c
              :discount (double discount) :inputs (some-> inputs vec)}
       by (assoc :by by)
+      group-shrink (assoc :gshrink {:groups (mapv #(mapv long %) (:groups group-shrink))
+                                    :tau (double (:tau group-shrink))
+                                    :rate (double (or (:rate group-shrink) (- 1.0 (double discount))))})
       ;; per coefficient, the discount's scale: the deviations of pooled
       ;; slopes are held (a discount on them would dissolve the pooling),
       ;; as is every coefficient in :hold
@@ -81,7 +90,11 @@
                                    (if (or (>= i k0) (held i)) 1.0 (/ 1.0 (Math/sqrt (double discount)))))))))))
 
 (defn logistic
-  "A dynamic logistic regression for binary outcomes. Options above."
+  "A dynamic logistic regression for binary outcomes. Options above, and
+  :group-shrink {:groups [[i ...] ...] :tau t :rate r}: each group of
+  coefficients shrunk toward zero by its own horseshoe-type scale (see
+  `group-scales`), so a group that carries nothing shrinks and one that
+  carries a signal escapes."
   [opts]
   (model :logistic opts))
 
@@ -216,7 +229,7 @@
             (dotimes [j k]
               (aset c (+ (* i k) j) (- (aget c (+ (* i k) j)) (* (aget cx i) (aget cx j) shrink))))))))))
 
-(declare step-averaged predict-averaged step-posterior)
+(declare step-averaged step-averaged* predict-averaged step-posterior pooled-moments)
 
 (defn predict
   "The probability of the outcome (logistic), the expected count
@@ -231,14 +244,16 @@
 
 (declare predictive)
 
-(defn- predictive-averaged [{:keys [models w kind]} x offset]
+(defn- predictive-averaged [{:keys [models w kind] :as avg} x offset]
+  (if (#{:evidence :synth} (:rule (:weighting avg)))
+    (pooled-moments avg x offset)
   (let [ms (for [[k mdl] models] [(w k) (predictive mdl x offset)])
         f (reduce + (for [[wk {:keys [f]}] ms] (* wk f)))]
     (cond-> {:f f
              ;; the mixture's variance: within the models plus between their means
              :q (- (reduce + (for [[wk {f' :f q' :q}] ms] (* wk (+ q' (* f' f'))))) (* f f))}
       ;; the noise beside it, the models' estimates weighted
-      (= :linear kind) (assoc :s (reduce + (for [[wk {s' :s}] ms] (* wk s')))))))
+      (= :linear kind) (assoc :s (reduce + (for [[wk {s' :s}] ms] (* wk s'))))))))
 
 (defn predictive
   "The linear predictor's predictive moments for inputs x in the coming
@@ -354,13 +369,61 @@
       (dotimes [i (* k k)] (aset c i (/ (aget c i) discount))))
     [mm c]))
 
+(defn- half-cauchy-scale
+  "The mode of a group's local scale u = lambda^2 under a half-Cauchy
+  prior on lambda, its k coefficients N(0, tau^2 u) with sum of squares s
+  tau^2 (Carvalho, Polson & Scott 2010's horseshoe, by group): the root of
+  (k + 3) u^2 - (s - k - 1) u - s = 0. Near s / (k + 3) for a group that
+  carries a signal, near zero for one that carries none."
+  ^double [^double s ^long k]
+  (let [a (+ k 3.0) b (- s k 1.0)]
+    (/ (+ b (Math/sqrt (+ (* b b) (* 4.0 a s)))) (* 2.0 a))))
+
+(defn- pseudo-zero!
+  "Updates mm and c in place with a pseudo-observation that coefficient i
+  is zero, with variance r (the exact Gaussian update)."
+  [^doubles mm ^doubles c ^long k ^long i ^double r]
+  (let [big-q (+ (aget c (+ (* i k) i)) r)
+        ci (double-array k)]
+    (dotimes [j k] (aset ci j (aget c (+ (* j k) i))))
+    (let [e (/ (- (aget mm i)) big-q)]
+      (dotimes [j k] (aset mm j (+ (aget mm j) (* (aget ci j) e)))))
+    (dotimes [a k]
+      (dotimes [b k]
+        (aset c (+ (* a k) b) (- (aget c (+ (* a k) b)) (/ (* (aget ci a) (aget ci b)) big-q)))))))
+
+(defn- shrink-groups!
+  "Shrinks each group of `gshrink` in place: its local scale u from its
+  coefficients' second moments (m^2 + C, after the discount), then a
+  pseudo-observation of each coefficient at zero with variance tau^2 u /
+  rate. The rate is what the discount forgets each period (1 - discount by
+  default), so the shrinkage prior is refreshed as fast as it fades and
+  holds at about its full weight however long the model runs. The scales."
+  [^doubles mm ^doubles c ^long k {:keys [groups tau rate]}]
+  (let [t2 (* (double tau) (double tau))]
+    (mapv (fn [g]
+            (let [s (/ (reduce + 0.0 (map (fn [i] (let [i (long i)] (+ (* (aget mm i) (aget mm i)) (aget c (+ (* i k) i))))) g)) t2)
+                  u (half-cauchy-scale s (count g))
+                  r (/ (* t2 (Math/max 1e-12 u)) (double rate))]
+              (doseq [i g] (pseudo-zero! mm c k (long i) r))
+              u))
+          groups)))
+
+(defn group-scales
+  "A model with :group-shrink: each group's local scale (lambda^2, in units
+  of tau^2) at its last period, in the order of its groups; nil before."
+  [state]
+  (:scales state))
+
 (defn step
   "The state after a period: discounted, then updated with each of `rows`."
   [state rows]
   (if (= :averaged (:type state))
     (step-averaged state rows)
-    (let [{:keys [type k]} state
-          [mm c] (discounted state)]
+    (let [{:keys [type k gshrink]} state
+          [mm c] (discounted state)
+          scales (when gshrink (shrink-groups! mm c (long k) gshrink))
+          state (cond-> state gshrink (assoc :scales scales))]
       (if (= :linear type)
         (first (linear-step state mm c rows))
         (do (doseq [{:keys [x y w o]} rows]
@@ -391,6 +454,28 @@
   is not ignoring: a model whose forecasts only add noise keeps a share
   of the weight and adds its noise to the average.
 
+  :weighting {:rule :evidence :base b :scale c :parents {name parent}
+  :cap true} ranks the models by their proven increment instead
+  (bnm-56c.2): each model's discounted log score (the period's log
+  predictive before it learns, discounted by :forget), less its parent's
+  (b unless :parents names another: a model nested in another is set
+  against it), per discounted row, is its gain g. Each model's weight is
+  g+ / (c + the sum of every g+), the base's c / (c + the sum): c, nats per
+  row, is the prior's evidence for the base, so a model must prove a gain
+  to earn weight and weighs in proportion to it. The forecast's linear
+  predictor is the base's plus each model's increment over its parent
+  times its weight (a log pool, residual layers ordered by evidence); with
+  :cap (the default), taken strongest first, no increment moves it further
+  than the largest of the stronger ones. It starts on the base.
+
+  :weighting {:rule :synth :discount d :var v} is a simple dynamic
+  predictive synthesis (after McAlinn & West 2019): a dynamic model of
+  the same kind whose inputs are an intercept and each model's predictive
+  linear predictor, its coefficients starting at 1/n (an even log pool)
+  with variance v (the intercept's 1) and discounted by d. Its intercept
+  and the coefficients' sum calibrate the pool; the coefficients are the
+  pool's time-varying weights (`weights`: their positive parts, shares).
+
   :prior {name share} starts the weights from those shares instead of
   equal ones, the models not named sharing the rest evenly, and the
   forgetting flattens the weights toward them (w^forget prior^(1 -
@@ -405,11 +490,18 @@
     (throw (ex-info "augur.dynamic/averaged: :prior's shares must be at least 0 and sum to at most 1" prior)))
   (when weighting
     (case (:rule weighting)
+      :evidence (do (need :averaged {:base (:base weighting) :scale (:scale weighting)})
+                    (when-not (and (contains? models (:base weighting)) (pos? (double (:scale weighting)))
+                                   (every? #(and (contains? models (key %)) (contains? models (val %))) (:parents weighting)))
+                      (throw (ex-info "augur.dynamic/averaged: :evidence needs a :base and :parents among the models and a positive :scale" weighting))))
+      :synth (do (need :averaged {:discount (:discount weighting) :var (:var weighting)})
+                 (when (some #(= :linear (:type %)) (vals models))
+                   (throw (ex-info "augur.dynamic/averaged: :synth needs logistic or Poisson models" weighting))))
       :stack (need :averaged {:rate (:rate weighting) :floor (:floor weighting)})
       :temper (do (need :averaged {:power (:power weighting)})
                   (when-not (< 0.0 (double (:power weighting)) 1.000001)
                     (throw (ex-info "augur.dynamic/averaged: :temper's :power must be in (0, 1]" weighting))))
-      (throw (ex-info "augur.dynamic/averaged: :weighting's :rule must be :stack or :temper" weighting))))
+      (throw (ex-info "augur.dynamic/averaged: :weighting's :rule must be :stack, :temper, :evidence or :synth" weighting))))
   (let [kinds (set (map :type (vals models)))]
     (when (not= 1 (count kinds))
       (throw (ex-info "augur.dynamic/averaged needs models of one kind" {:kinds kinds})))
@@ -422,14 +514,70 @@
                                                      (double (prior k))
                                                      (/ (- 1.0 named) (double others)))]))]
                               (assoc avg :prior pi :w pi)))
-      weighting (assoc :weighting (if (= :stack (:rule weighting))
-                                    {:rule :stack :rate (double (:rate weighting)) :floor (double (:floor weighting))}
-                                    {:rule :temper :power (double (:power weighting))})))))
+      weighting (assoc :weighting (case (:rule weighting)
+                                    :stack {:rule :stack :rate (double (:rate weighting)) :floor (double (:floor weighting))}
+                                    :temper {:rule :temper :power (double (:power weighting))}
+                                    :evidence {:rule :evidence :base (:base weighting) :scale (double (:scale weighting))
+                                               :parents (or (:parents weighting) {}) :cap (get weighting :cap true)}
+                                    :synth {:rule :synth :discount (double (:discount weighting)) :var (double (:var weighting))}))
+      (= :evidence (:rule weighting))
+      (assoc :ev (zipmap (keys models) (repeat 0.0)) :n 0.0 :gains (zipmap (keys models) (repeat 0.0))
+             :w (into {} (for [k (keys models)] [k (if (= k (:base weighting)) 1.0 0.0)])))
+      (= :synth (:rule weighting))
+      (as-> avg (let [order (vec (sort-by str (keys models)))
+                      n (count order)]
+                  (assoc avg :order order
+                         :synth (model (first kinds) {:mean (into [0.0] (repeat n (/ 1.0 n)))
+                                                      :var (into [1.0] (repeat n (double (:var weighting))))
+                                                      :discount (:discount weighting)})))))))
 
 (defn weights "Each model's weight after the last period." [avg] (:w avg))
 
-(defn- predict-averaged [{:keys [models w]} x offset]
-  (reduce + (for [[k mdl] models] (* (w k) (predict mdl x offset)))))
+
+
+(defn- from-moments
+  "The predictive mean of an outcome whose linear predictor is N(f, q)."
+  ^double [kind ^double f ^double q]
+  (case kind
+    :logistic (m/expit (/ f (Math/sqrt (+ 1.0 (/ (* Math/PI q) 8.0)))))
+    :poisson (Math/exp (+ f (* 0.5 q)))
+    :linear f))
+
+(defn- pooled? [avg] (#{:evidence :synth} (:rule (:weighting avg))))
+
+(defn- predict-averaged [{:keys [models w kind] :as avg} x offset]
+  (if (pooled? avg)
+    (let [{:keys [f q]} (pooled-moments avg x offset)] (from-moments kind f q))
+    (reduce + (for [[k mdl] models] (* (w k) (predict mdl x offset))))))
+
+(defn- synth-inputs
+  "The synthesis' inputs for x: an intercept and each model's predictive
+  moments, in the synthesis' order. [inputs qs]"
+  [{:keys [models order]} x offset]
+  (let [ps (mapv #(predictive (models %) x offset) order)]
+    [(into [1.0] (map :f ps)) (mapv :q ps)]))
+
+(defn- pooled-moments
+  "The linear predictor's moments under the :evidence or :synth rule."
+  [{:keys [models w weighting gains synth] :as avg} x offset]
+  (case (:rule weighting)
+    :evidence
+    (let [{:keys [base parents cap]} weighting
+          pm (into {} (for [[k mdl] models] [k (predictive mdl x offset)]))
+          parent (fn [k] (get parents k base))
+          order (sort-by (fn [k] [(- (double (gains k 0.0))) (str k)])
+                         (filter #(and (not= base %) (pos? (double (w % 0.0)))) (keys models)))
+          [f _] (reduce (fn [[f top] k]
+                          (let [c (* (double (w k)) (- (double (:f (pm k))) (double (:f (pm (parent k))))))
+                                c (if (and cap top) (Math/max (- (double top)) (Math/min (double top) c)) c)]
+                            [(+ f c) (Math/max (double (or top 0.0)) (Math/abs c))]))
+                        [(double (:f (pm base))) nil] order)]
+      {:f f :q (reduce + 0.0 (for [[k v] w] (* (double v) (double (:q (pm k))))))})
+    :synth
+    (let [[xs qs] (synth-inputs avg x offset)
+          theta (:m synth)
+          {:keys [f q]} (predictive synth xs 0.0)]
+      {:f f :q (+ (double q) (reduce + 0.0 (map-indexed (fn [i qk] (let [t (aget ^doubles theta (inc i))] (* t t (double qk)))) qs)))})))
 
 (defn- flattened
   "The weights `w` flattened by `forget`, toward the prior's shares when
@@ -463,7 +611,41 @@
                 (recur (next rows) (update-vals w #(/ % z))))))]
     (update-vals w #(+ (* (- 1.0 floor) %) (/ floor n)))))
 
+(defn- evidence-weights
+  "The :evidence rule's gains and weights from the discounted log scores
+  `ev` over `n` discounted rows."
+  [ev n {:keys [base scale parents]}]
+  (let [gains (into {} (for [[k e] ev :when (not= k base)]
+                         [k (if (pos? n) (/ (- (double e) (double (ev (get parents k base)))) n) 0.0)]))
+        pos (update-vals gains #(Math/max 0.0 (double %)))
+        z (+ (double scale) (reduce + 0.0 (vals pos)))]
+    [gains (assoc (update-vals pos #(/ % z)) base (/ (double scale) z))]))
+
+(defn- step-evidence [{:keys [models forget weighting ev n] :as avg} rows]
+  (let [ll (into {} (for [[k mdl] models] [k (log-score mdl rows)]))
+        ev (into {} (for [[k e] ev] [k (+ (* forget (double e)) (double (ll k)))]))
+        n (+ (* forget (double n)) (reduce + 0.0 (map #(double (or (:w %) 1.0)) rows)))
+        [gains w] (evidence-weights ev n weighting)]
+    (assoc avg :ev ev :n n :gains gains :w w
+           :models (into {} (for [[k mdl] models] [k (step mdl rows)])))))
+
+(defn- step-synth [{:keys [models order synth] :as avg} rows]
+  (let [srows (vec (for [{:keys [x y w o]} rows]
+                     (cond-> {:x (first (synth-inputs avg x (double (or o 0.0)))) :y y} w (assoc :w w))))
+        synth (step synth srows)
+        theta (mapv #(Math/max 0.0 (double %)) (rest (means synth)))
+        z (reduce + 0.0 theta)]
+    (assoc avg :synth synth
+           :w (zipmap order (if (pos? z) (map #(/ % z) theta) (repeat (/ 1.0 (count order)))))
+           :models (into {} (for [[k mdl] models] [k (step mdl rows)])))))
+
 (defn- step-averaged [{:keys [models w forget weighting] :as avg} rows]
+  (case (:rule weighting)
+    :evidence (step-evidence avg rows)
+    :synth (step-synth avg rows)
+    (step-averaged* avg rows)))
+
+(defn- step-averaged* [{:keys [models w forget weighting] :as avg} rows]
   (if (= :stack (:rule weighting))
     (let [flat (flattened w forget (:prior avg))]
       (assoc avg

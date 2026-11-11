@@ -475,3 +475,87 @@
     (is (< (Math/abs (- 2.0 (:f (d/predictive pooled [1.0 1.0 0])))) 1e-12) (:f (d/predictive pooled [1.0 1.0 0])))
     (testing "the variance: the discounted part widened, the held not"
       (is (< (Math/abs (- 3.0 (:q (d/predictive held x)))) 1e-12) (:q (d/predictive held x))))))
+
+;; --- ranking signals by their proven increment (bnm-56c.2) -------------------
+
+(defn- strong-and-weak-periods
+  "Periods of rows x = [1 z1 z2 n1 n2 n3]: the outcome from a strong z1 and a
+  weak z2; the n's are noise."
+  [g periods n]
+  (vec (for [_ (range periods)]
+         (vec (for [_ (range n)]
+                (let [z1 (m/normal! g) z2 (m/normal! g)
+                      x [1.0 z1 z2 (m/normal! g) (m/normal! g) (m/normal! g)]]
+                  {:x x :y (< (m/next-double! g) (m/expit (+ -2.0 (* 1.5 z1) (* 0.5 z2))))}))))))
+
+(defn- ranked-models []
+  {:base (d/logistic {:mean [0] :var [4] :discount 0.99 :inputs [0]})
+   :strong (d/logistic {:mean [0 0] :var [4 1] :discount 0.99 :inputs [0 1]})
+   :weak (d/logistic {:mean [0 0] :var [4 1] :discount 0.99 :inputs [0 2]})
+   ;; the strong model with the noise beside it: nested in :strong
+   :noisy (d/logistic {:mean [0 0 0 0 0] :var [4 1 1 1 1] :discount 0.99 :inputs [0 1 3 4 5]})})
+
+(def ^:private evidence-rule {:rule :evidence :base :base :scale 0.005 :parents {:noisy :strong}})
+
+(deftest evidence-orders-signals-and-keeps-the-weak-one-secondary
+  (let [periods (strong-and-weak-periods (m/rng-mixed 61) 150 40)
+        path (map d/weights (rest (reductions d/step (d/averaged (ranked-models) {:forget 0.98 :weighting evidence-rule}) periods)))
+        end (last path)]
+    (is (> (:strong end) (:weak end) 0.05) end)
+    (is (< (:noisy end) 0.05) "the noise nested in the strong model adds nothing over it")
+    (is (< (apply max (vals end)) 0.95) "no selection")
+    (is (< (Math/abs (- 1.0 (reduce + (vals end)))) 1e-9))
+    (testing "the order is stable once the evidence is in"
+      (is (every? #(> (:strong %) (:weak %)) (drop 50 path))))))
+
+(deftest evidence-starts-on-the-base
+  (let [avg (d/averaged (ranked-models) {:forget 0.98 :weighting evidence-rule})]
+    (is (= 1.0 (:base (d/weights avg))))
+    (is (< (Math/abs (- (d/predict avg [1.0 2.0 0 0 0 0]) (d/predict (:base (:models avg)) [1.0 2.0 0 0 0 0]))) 1e-12)))
+  (is (thrown? clojure.lang.ExceptionInfo (d/averaged (ranked-models) {:forget 1.0 :weighting {:rule :evidence :base :nope :scale 0.01}})))
+  (is (thrown? clojure.lang.ExceptionInfo (d/averaged (ranked-models) {:forget 1.0 :weighting {:rule :evidence :base :base}}))))
+
+(deftest a-weaker-increment-is-capped-by-a-stronger-one
+  ;; base 0, strong +1, weak +3 (log odds); weights 0.5 and 0.3: uncapped the
+  ;; weak model would move the forecast 0.9, more than the strong one's 0.5
+  (let [mk (fn [b] (d/logistic {:mean [b] :var [1e-12] :discount 1.0 :inputs [0]}))
+        avg (-> (d/averaged {:base (mk 0.0) :strong (mk 1.0) :weak (mk 3.0)} {:forget 1.0 :weighting {:rule :evidence :base :base :scale 0.01}})
+                (assoc :w {:base 0.2 :strong 0.5 :weak 0.3} :gains {:strong 0.02 :weak 0.01}))
+        uncapped (assoc-in avg [:weighting :cap] false)]
+    (is (< (Math/abs (- 1.0 (:f (d/predictive avg [1.0])))) 1e-9) (d/predictive avg [1.0]))
+    (is (< (Math/abs (- 1.4 (:f (d/predictive uncapped [1.0])))) 1e-9))))
+
+(deftest group-shrinkage-shrinks-noise-and-lets-signal-escape
+  (let [periods (strong-and-weak-periods (m/rng-mixed 62) 200 40)
+        opts {:mean [0 0 0 0 0 0] :var [4 1 1 1 1 1] :discount 0.98}
+        plain (run (d/logistic opts) periods)
+        shrunk (run (d/logistic (assoc opts :group-shrink {:groups [[1] [2] [3 4 5]] :tau 0.5})) periods)
+        rms (fn [s ix] (Math/sqrt (/ (reduce + (map #(let [v (nth (d/means s) %)] (* v v)) ix)) (count ix))))]
+    (is (< (rms shrunk [3 4 5]) (* 0.6 (rms plain [3 4 5]))) [(rms shrunk [3 4 5]) (rms plain [3 4 5])])
+    (is (< (Math/abs (- (nth (d/means shrunk) 1) (nth (d/means plain) 1))) (* 0.15 (nth (d/means plain) 1)))
+        "the strong slope escapes")
+    (is (> (nth (d/means shrunk) 2) 0.25) "the weak one is kept")
+    (let [[s w n] (d/group-scales shrunk)]
+      (is (> s w n) [s w n])))
+  (testing "no groups, no change"
+    (let [periods (strong-and-weak-periods (m/rng-mixed 63) 20 20)
+          opts {:mean [0 0 0 0 0 0] :var [4 1 1 1 1 1] :discount 0.98}]
+      (is (= (d/means (run (d/logistic opts) periods))
+             (d/means (run (d/logistic (assoc opts :group-shrink {:groups [] :tau 0.5})) periods)))))))
+
+(deftest synthesis-recalibrates-its-agents
+  ;; one agent twice too sure (log odds -2 + 2z, the truth -1 + z), held
+  ;; fixed: the synthesis learns a slope near one half on it
+  (let [g (m/rng-mixed 64)
+        periods (vec (for [_ (range 120)]
+                       (vec (for [_ (range 40)]
+                              (let [x [1.0 (m/normal! g)]]
+                                {:x x :y (< (m/next-double! g) (m/expit (+ -1.0 (nth x 1))))})))))
+        sure (d/logistic {:mean [-2.0 2.0] :var [1e-12 1e-12] :discount 1.0})
+        base (d/logistic {:mean [-1.5] :var [1e-12] :discount 1.0 :inputs [0]})
+        end (run (d/averaged {:sure sure :base base} {:forget 1.0 :weighting {:rule :synth :discount 0.99 :var 1.0}}) periods)
+        ;; the synthesis' inputs in sorted order: :base, :sure
+        [_ _ theta-sure] (d/means (:synth end))]
+    (is (< 0.35 theta-sure 0.65) (d/means (:synth end)))
+    (is (> (:sure (d/weights end)) 0.5))
+    (is (< (Math/abs (- (d/predict end [1.0 1.0]) (m/expit 0.0))) 0.06) (d/predict end [1.0 1.0]))))
