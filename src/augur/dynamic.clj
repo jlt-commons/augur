@@ -476,14 +476,25 @@
   and the coefficients' sum calibrate the pool; the coefficients are the
   pool's time-varying weights (`weights`: their positive parts, shares).
 
+  :evidence-at :issue scores each row, for every rule, by the predictive
+  each model issued for it (the row's :issued, from `issued` at the
+  forecast origin) rather than by the model's state when the row becomes
+  known (:learn, the default). Where outcomes are learned long after
+  their forecast, a model scored at learn time has meanwhile learned the
+  rows around it, and its evidence is hindsight fit, not forecast skill
+  (dynamic model averaging's evidence is the one-step-ahead predictive,
+  Raftery, Karny & Ettler 2010); every row then needs its :issued.
+
   :prior {name share} starts the weights from those shares instead of
   equal ones, the models not named sharing the rest evenly, and the
   forgetting flattens the weights toward them (w^forget prior^(1 -
   forget)) rather than toward equal weights: where the models fit alike
   the weights stay at the prior, and evidence moves them off it as
   before."
-  [models {:keys [forget weighting prior]}]
+  [models {:keys [forget weighting prior evidence-at]}]
   (need :averaged {:forget forget})
+  (when-not (contains? #{nil :learn :issue} evidence-at)
+    (throw (ex-info "augur.dynamic/averaged: :evidence-at must be :learn or :issue" {:evidence-at evidence-at})))
   (when-let [bad (seq (remove (set (keys models)) (keys prior)))]
     (throw (ex-info "augur.dynamic/averaged: :prior names a model that is not averaged" {:models (vec bad)})))
   (when (or (some #(neg? (double %)) (vals prior)) (> (reduce + 0.0 (vals prior)) 1.000001))
@@ -507,6 +518,7 @@
       (throw (ex-info "augur.dynamic/averaged needs models of one kind" {:kinds kinds})))
     (cond-> {:type :averaged :kind (first kinds) :models models :forget (double forget)
              :w (into {} (for [k (keys models)] [k (/ 1.0 (count models))]))}
+      (= :issue evidence-at) (assoc :evidence-at :issue)
       (seq prior) (as-> avg (let [named (reduce + 0.0 (map double (vals prior)))
                                   others (- (count models) (count prior))
                                   pi (into {} (for [k (keys models)]
@@ -532,6 +544,47 @@
                                                       :discount (:discount weighting)})))))))
 
 (defn weights "Each model's weight after the last period." [avg] (:w avg))
+
+(defn issued
+  "Each averaged model's predictive for inputs x and `offset` now, {name
+  (predictive model x offset)}: what a row carries as :issued, recorded
+  when its forecast is issued, for :evidence-at :issue."
+  [{:keys [models]} x offset]
+  (into {} (for [[k mdl] models] [k (predictive mdl x offset)])))
+
+(defn- issued-score
+  "The log probability of outcome y under an issued predictive (the
+  linear predictor's moments, offset included), times the row's weight w."
+  ^double [kind {:keys [f q s n]} y ^double w]
+  (* w (case kind
+         :logistic (let [p (m/expit (/ (double f) (Math/sqrt (+ 1.0 (/ (* Math/PI (double q)) 8.0)))))]
+                     (Math/log (Math/max 1e-300 (if (event? y) p (- 1.0 p)))))
+         :poisson (poisson-log-predictive (double f) (double q) (double y))
+         :linear (linear-log-density (double y) (double f) (+ (double q) (double s)) (double n)))))
+
+(defn- issued-of
+  "A row's issued predictive for model k; throws when it has none."
+  [row k]
+  (or (get-in row [:issued k])
+      (throw (ex-info "augur.dynamic: :evidence-at :issue needs each row's :issued predictive for every model"
+                      {:model k :row (dissoc row :issued)}))))
+
+(defn- issue? [avg] (= :issue (:evidence-at avg)))
+
+(defn evidence
+  "Each averaged model's evidence from `rows` before it learns them, {name
+  log probability}: the log score of each row by the predictive the model
+  issued for it (:evidence-at :issue), else by its state now (a linear
+  model's sequentially, each row given the ones before it). What the
+  averaging weighs the models by."
+  [{:keys [models kind] :as avg} rows]
+  (if (issue? avg)
+    (into {} (for [k (keys models)]
+                [k (reduce + 0.0 (for [r rows] (issued-score kind (issued-of r k) (:y r) (double (or (:w r) 1.0)))))]))
+    (into {} (for [[k mdl] models]
+               [k (if (= :linear (:type mdl))
+                    (let [[mm c] (discounted mdl)] (second (linear-step mdl mm c rows)))
+                    (log-score mdl rows))]))))
 
 
 
@@ -593,7 +646,7 @@
   "The weights after `rows` by exponentiated gradient on the mixture's log
   score, each model's predictive from its state before the period, then
   floored."
-  [models w {:keys [rate floor]} rows]
+  [{:keys [models kind] :as avg} w {:keys [rate floor]} rows]
   (let [ks (vec (keys models))
         n (count ks)
         w (loop [rows (seq rows) w w]
@@ -601,7 +654,9 @@
               w
               (let [r (first rows)
                     r1 (dissoc r :w)
-                    ps (into {} (for [k ks] [k (Math/exp (log-score (models k) [r1]))]))
+                    ps (into {} (for [k ks] [k (Math/exp (if (issue? avg)
+                                                          (issued-score kind (issued-of r k) (:y r) 1.0)
+                                                          (log-score (models k) [r1])))]))
                     mix (Math/max 1e-300 (reduce + (for [k ks] (* (w k) (ps k)))))
                     eta (* rate (double (or (:w r) 1.0)))
                     ;; centred on the best ratio so the exponent stays bounded
@@ -622,7 +677,7 @@
     [gains (assoc (update-vals pos #(/ % z)) base (/ (double scale) z))]))
 
 (defn- step-evidence [{:keys [models forget weighting ev n] :as avg} rows]
-  (let [ll (into {} (for [[k mdl] models] [k (log-score mdl rows)]))
+  (let [ll (if (issue? avg) (evidence avg rows) (into {} (for [[k mdl] models] [k (log-score mdl rows)])))
         ev (into {} (for [[k e] ev] [k (+ (* forget (double e)) (double (ll k)))]))
         n (+ (* forget (double n)) (reduce + 0.0 (map #(double (or (:w %) 1.0)) rows)))
         [gains w] (evidence-weights ev n weighting)]
@@ -630,8 +685,13 @@
            :models (into {} (for [[k mdl] models] [k (step mdl rows)])))))
 
 (defn- step-synth [{:keys [models order synth] :as avg} rows]
-  (let [srows (vec (for [{:keys [x y w o]} rows]
-                     (cond-> {:x (first (synth-inputs avg x (double (or o 0.0)))) :y y} w (assoc :w w))))
+  (let [srows (vec (for [{:keys [x y w o] :as r} rows]
+                     (cond-> {:x (if (issue? avg)
+                                   ;; the models' linear predictors as issued
+                                   (into [1.0] (map #(:f (issued-of r %)) order))
+                                   (first (synth-inputs avg x (double (or o 0.0)))))
+                              :y y}
+                       w (assoc :w w))))
         synth (step synth srows)
         theta (mapv #(Math/max 0.0 (double %)) (rest (means synth)))
         z (reduce + 0.0 theta)]
@@ -649,7 +709,7 @@
   (if (= :stack (:rule weighting))
     (let [flat (flattened w forget (:prior avg))]
       (assoc avg
-             :w (stacked-weights models flat weighting rows)
+             :w (stacked-weights avg flat weighting rows)
              :models (into {} (for [[k mdl] models] [k (step mdl rows)]))))
     (step-posterior avg rows)))
 
@@ -658,10 +718,12 @@
         ;; each model's evidence: how likely it made the period's outcomes
         ;; a linear model's is exact and sequential: each row given the
         ;; ones before it (its step computes it)
-        stepped (into {} (for [[k mdl] models]
-                           [k (if (= :linear (:type mdl))
-                                (let [[mm c] (discounted mdl)] (linear-step mdl mm c rows))
-                                [nil (log-score mdl rows)])]))
+        stepped (if (issue? avg)
+                  (into {} (for [[k e] (evidence avg rows)] [k [nil e]]))
+                  (into {} (for [[k mdl] models]
+                             [k (if (= :linear (:type mdl))
+                                  (let [[mm c] (discounted mdl)] (linear-step mdl mm c rows))
+                                  [nil (log-score mdl rows)])])))
         power (if (= :temper (:rule (:weighting avg))) (:power (:weighting avg)) 1.0)
         ll (update-vals stepped #(* power (second %)))
         top (apply max (vals ll))

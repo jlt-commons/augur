@@ -559,3 +559,64 @@
     (is (< 0.35 theta-sure 0.65) (d/means (:synth end)))
     (is (> (:sure (d/weights end)) 0.5))
     (is (< (Math/abs (- (d/predict end [1.0 1.0]) (m/expit 0.0))) 0.06) (d/predict end [1.0 1.0]))))
+
+;; Issue-time evidence (bnm-56c loop audit, issue 2). Outcomes become known
+;; `lag` periods after their forecast; B's input matters with a sign that
+;; flips every era of `lag` periods. Scored when a row is learned, B has
+;; meanwhile learned the earlier rows of the same era (hindsight) and looks
+;; skilful; scored by the predictive it issued, it read the previous era's
+;; sign and has no skill.
+(defn- delayed-stream
+  "Runs `avg` over a delayed stream: each period issues `n` rows, records
+  each model's issue-time predictive (d/issued), and learns the rows
+  issued `lag` periods before. The final average."
+  [avg seed]
+  (let [g (m/rng seed)
+        lag 5 n 30 periods 120
+        sign (vec (for [_ (range (inc (quot periods lag)))] (if (< (m/next-double! g) 0.5) -1.0 1.0)))]
+    (loop [t 0 avg avg pending []]
+      (if (= t periods)
+        avg
+        (let [{ready true waiting false} (group-by #(<= (:known-at %) t) pending)
+              avg (d/step avg (mapv #(dissoc % :known-at) ready))
+              made (vec (for [_ (range n)]
+                          (let [z (if (< (m/next-double! g) 0.5) -1.0 1.0)
+                                x [1.0 z]]
+                            {:x x :y (< (m/next-double! g) (m/expit (* 3.0 (sign (quot t lag)) z)))
+                             :issued (d/issued avg x 0.0) :known-at (+ t lag)})))]
+          (recur (inc t) avg (into (vec waiting) made)))))))
+
+(defn- two-models []
+  {:base (d/logistic {:mean [0.0] :var [1.0] :discount 0.99 :inputs [0]})
+   :b (d/logistic {:mean [0.0 0.0] :var [1.0 1.0] :discount 0.8})})
+
+(deftest evidence-at-issue-does-not-reward-hindsight
+  (let [learn (delayed-stream (d/averaged (two-models) {:forget 0.995}) 3)
+        issue (delayed-stream (d/averaged (two-models) {:forget 0.995 :evidence-at :issue}) 3)]
+    (is (> (:b (d/weights learn)) 0.9) "scored at learn time, hindsight selects B")
+    (is (> (:base (d/weights issue)) 0.99) "scored as issued, the base keeps the weight")
+    (testing "the other rules read the same evidence"
+      (let [ev (delayed-stream (d/averaged (two-models) {:forget 0.995 :evidence-at :issue
+                                                         :weighting {:rule :evidence :base :base :scale 0.005}}) 3)]
+        (is (> (:base (d/weights ev)) 0.99) (d/weights ev)))
+      (let [stk (delayed-stream (d/averaged (two-models) {:forget 0.995 :evidence-at :issue
+                                                          :weighting {:rule :stack :rate 0.05 :floor 0.0}}) 3)
+            stk-learn (delayed-stream (d/averaged (two-models) {:forget 0.995
+                                                                :weighting {:rule :stack :rate 0.05 :floor 0.0}}) 3)]
+        (is (< (:b (d/weights stk)) (:b (d/weights stk-learn))))))))
+
+(deftest issued-evidence-is-the-issued-forecast-s-log-score
+  (let [g (m/rng 4)
+        avg (d/averaged (two-models) {:forget 0.99 :evidence-at :issue})
+        avg (d/step avg (mapv #(assoc % :issued (d/issued avg (:x %) 0.0)) (rows g 40 [0.5 1.0 0.0])))
+        x [1.0 0.7]
+        issued (d/issued avg x 0.3)
+        p (d/predict (get-in avg [:models :b]) x 0.3)]
+    (is (= (set (keys issued)) #{:base :b}))
+    (is (< (Math/abs (- (Math/log p) (:b (d/evidence avg [{:x x :y true :o 0.3 :issued issued}])))) 1e-12))
+    (testing "issued now, the issue-time evidence is the learn-time one"
+      (let [now (d/evidence avg [{:x x :y false :o 0.3 :issued issued}])
+            learned (d/evidence (dissoc avg :evidence-at) [{:x x :y false :o 0.3}])]
+        (is (every? #(< (Math/abs (- (now %) (learned %))) 1e-12) [:base :b]) [now learned])))
+    (is (thrown? clojure.lang.ExceptionInfo (d/step avg [{:x x :y true}])) "a row without its issued predictive")
+    (is (thrown? clojure.lang.ExceptionInfo (d/averaged (two-models) {:forget 0.99 :evidence-at :later})))))
