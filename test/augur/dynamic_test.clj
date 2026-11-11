@@ -355,3 +355,78 @@
                (d/predict (pooled-model 0.1) [1.0 0.0 0.0 2.0])))
   (is (thrown? clojure.lang.ExceptionInfo
                (d/logistic {:mean [0 0] :var [1 1] :discount 1.0 :by {:index 2 :groups 2 :slopes [5] :tau 0.1}}))))
+
+;; --- stacking: weights that blend, not select -----------------------------
+
+(defn- noisy-copy-periods
+  "Periods of rows x = [1 z n1 n2 n3], the outcome from z alone; the n's are noise."
+  [g periods n]
+  (vec (for [_ (range periods)]
+         (vec (for [_ (range n)]
+                (let [z (m/normal! g)
+                      x [1.0 z (m/normal! g) (m/normal! g) (m/normal! g)]]
+                  {:x x :y (< (m/next-double! g) (m/expit (+ -2.0 z)))}))))))
+
+(defn- good-and-noisy []
+  {:good (d/logistic {:mean [0 0] :var [4 1] :discount 0.99 :inputs [0 1]})
+   :noisy (d/logistic {:mean [0 0 0 0 0] :var [4 1 1 1 1] :discount 0.99 :inputs [0 1 2 3 4]})})
+
+(deftest stacking-blends-where-posterior-weights-select
+  (let [periods (noisy-copy-periods (m/rng-mixed 31) 120 30)
+        st (run (d/averaged (good-and-noisy) {:forget 0.95 :weighting {:rule :stack :rate 0.02 :floor 0.05}}) periods)
+        hist (fn [avg] (map d/weights (reductions d/step avg periods)))
+        dma-path (hist (d/averaged (good-and-noisy) {:forget 0.95}))
+        st-path (hist (d/averaged (good-and-noisy) {:forget 0.95 :weighting {:rule :stack :rate 0.02 :floor 0.05}}))]
+    (is (> (apply max (map #(apply max (vals %)) dma-path)) 0.95) "posterior weights collapse onto one model")
+    (is (every? #(>= (apply min (vals %)) (- 0.025 1e-12)) st-path) "stacking keeps every weight above floor / n")
+    (is (< (apply max (map #(apply max (vals %)) st-path)) 0.95) "stacking does not")
+    (testing "blending is not ignoring: the noisy copy keeps about half the weight"
+      (is (< 0.4 (:good (d/weights st)) 0.6) (d/weights st)))))
+
+(deftest stacking-still-finds-what-matters
+  (let [g (m/rng-mixed 32)
+        period (fn [beta] (vec (for [_ (range 40)]
+                                 (let [x [1.0 (m/normal! g) (m/normal! g)]]
+                                   {:x x :y (< (m/next-double! g) (m/expit (reduce + (map * beta x))))}))))
+        models {:first (d/logistic {:mean [0 0] :var [4 4] :discount 0.98 :inputs [0 1]})
+                :second (d/logistic {:mean [0 0] :var [4 4] :discount 0.98 :inputs [0 2]})}
+        end (run (d/averaged models {:forget 1.0 :weighting {:rule :stack :rate 0.05 :floor 0.02}})
+                 (repeatedly 40 #(period [-1.0 0.0 2.0])))]
+    (is (> (:second (d/weights end)) 0.8) (d/weights end))))
+
+(deftest weighting-needs-a-known-rule
+  (is (thrown? clojure.lang.ExceptionInfo
+               (d/averaged (good-and-noisy) {:forget 1.0 :weighting {:rule :nope}})))
+  (is (thrown? clojure.lang.ExceptionInfo
+               (d/averaged (good-and-noisy) {:forget 1.0 :weighting {:rule :stack :rate 0.1}}))
+      "stacking needs a floor"))
+
+(deftest tempered-posterior-weights
+  (let [periods (noisy-copy-periods (m/rng-mixed 36) 120 30)
+        path (fn [opts] (map d/weights (rest (reductions d/step (d/averaged (good-and-noisy) opts) periods))))
+        plain (path {:forget 0.95})
+        one (path {:forget 0.95 :weighting {:rule :temper :power 1.0}})
+        tempered (path {:forget 0.95 :weighting {:rule :temper :power 0.1}})
+        extreme (fn [ws] (/ (reduce + (map #(apply max (vals %)) ws)) (count ws)))]
+    (is (= plain one) "a power of one is the posterior")
+    (is (< (extreme tempered) (extreme plain)) "a smaller power selects less sharply")
+    (is (> (/ (reduce + (map :good tempered)) (count tempered)) 0.5) "and still favours the model without noise"))
+  (is (thrown? clojure.lang.ExceptionInfo (d/averaged (good-and-noisy) {:forget 1.0 :weighting {:rule :temper}}))))
+
+(deftest held-coefficients-are-not-discounted
+  (let [st (d/step (d/logistic {:mean [0 0 0] :var [4 1 1] :discount 0.5 :hold [2]}) [])
+        ^doubles c (:c st)]
+    (is (< (Math/abs (- (aget c 0) 8.0)) 1e-12) "the intercept discounted")
+    (is (< (Math/abs (- (aget c 4) 2.0)) 1e-12))
+    (is (< (Math/abs (- (aget c 8) 1.0)) 1e-12) "a held slope keeps its variance"))
+  (testing "an empty input held settles nearer zero than one that drifts"
+    (let [g (m/rng-mixed 41)
+          periods (vec (repeatedly 200 #(vec (for [_ (range 20)]
+                                               (let [x [1.0 (m/normal! g)]]
+                                                 {:x x :y (< (m/next-double! g) 0.1)})))))
+          path (fn [opts] (map #(second (d/means %)) (rest (reductions d/step (d/logistic opts) periods))))
+          drift (path {:mean [0 0] :var [4 0.1] :discount 0.98})
+          held (path {:mean [0 0] :var [4 0.1] :discount 0.98 :hold [1]})
+          rms (fn [xs] (Math/sqrt (/ (reduce + (map #(* % %) (drop 100 xs))) 100.0)))]
+      (is (< (rms held) (* 0.5 (rms drift))) [(rms held) (rms drift)])))
+  (is (thrown? clojure.lang.ExceptionInfo (d/logistic {:mean [0] :var [1] :discount 1.0 :hold [3]}))))

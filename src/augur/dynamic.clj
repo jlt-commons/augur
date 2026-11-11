@@ -54,10 +54,12 @@
       (throw (ex-info "augur.dynamic: :by needs groups > 0, slopes among the model's coefficients and a positive tau each" by)))
     {:index (long index) :groups (long groups) :slopes slopes :tau taus :base k}))
 
-(defn- model [kind {:keys [mean var discount inputs by] :as opts}]
+(defn- model [kind {:keys [mean var discount inputs by hold] :as opts}]
   (need kind {:mean mean :var var :discount discount})
   (when (not= (count mean) (count var))
     (throw (ex-info (str "augur.dynamic/" (name kind) " needs one variance per mean") opts)))
+  (when-not (every? #(< -1 (long %) (count mean)) hold)
+    (throw (ex-info (str "augur.dynamic/" (name kind) ": :hold names a coefficient the model does not have") opts)))
   (let [k0 (count mean)
         by (some->> by (by-layout k0))
         ;; pooled slopes: each group's deviation from the common slope, N(0, tau^2)
@@ -69,10 +71,14 @@
     (dotimes [i k] (aset c (+ (* i k) i) (double (nth var i))))
     (cond-> {:type kind :k k :m (double-array mean) :c c
              :discount (double discount) :inputs (some-> inputs vec)}
-      by (assoc :by by
-                ;; the common part is discounted, the deviations held: a
-                ;; discount on them would dissolve the pooling
-                :sv (double-array (for [i (range k)] (if (< i k0) (/ 1.0 (Math/sqrt (double discount))) 1.0)))))))
+      by (assoc :by by)
+      ;; per coefficient, the discount's scale: the deviations of pooled
+      ;; slopes are held (a discount on them would dissolve the pooling),
+      ;; as is every coefficient in :hold
+      (or by (seq hold))
+      (assoc :sv (let [held (set (map long hold))]
+                   (double-array (for [i (range k)]
+                                   (if (or (>= i k0) (held i)) 1.0 (/ 1.0 (Math/sqrt (double discount)))))))))))
 
 (defn logistic
   "A dynamic logistic regression for binary outcomes. Options above."
@@ -209,7 +215,7 @@
             (dotimes [j k]
               (aset c (+ (* i k) j) (- (aget c (+ (* i k) j)) (* (aget cx i) (aget cx j) shrink))))))))))
 
-(declare step-averaged predict-averaged)
+(declare step-averaged predict-averaged step-posterior)
 
 (defn predict
   "The probability of the outcome (logistic), the expected count
@@ -364,21 +370,80 @@
   "Dynamic model averaging over `models` ({name state}, all logistic,
   all Poisson or all linear), starting from equal weights; :forget
   (required) flattens the weights each period, so a model's past record
-  fades."
-  [models {:keys [forget]}]
+  fades.
+
+  :weighting {:rule :temper :power t} raises each period's likelihoods to
+  the power t (0 < t <= 1, tempered or fractional posterior weights;
+  Grunwald's safe Bayes): the evidence is the same, counted as if the
+  period held fewer independent rows, so the weights move more slowly and
+  select less sharply where the models fit about as well. t = 1 is the
+  posterior.
+
+  :weighting {:rule :stack :rate eta :floor phi} sets the weights by
+  stacking instead of by each model's posterior: each row moves them by
+  exponentiated gradient on the mixture's log score (w_k times exp(eta
+  p_k / p), p_k the model's predictive probability of the row and p the
+  mixture's; Helmbold et al. 1998), and each period they are mixed with
+  phi spread evenly, so no weight falls below phi / n. Posterior weights
+  multiply a period's likelihoods over all its rows and select one model
+  where several fit about as well; stacked weights blend them. Blending
+  is not ignoring: a model whose forecasts only add noise keeps a share
+  of the weight and adds its noise to the average."
+  [models {:keys [forget weighting]}]
   (need :averaged {:forget forget})
+  (when weighting
+    (case (:rule weighting)
+      :stack (need :averaged {:rate (:rate weighting) :floor (:floor weighting)})
+      :temper (do (need :averaged {:power (:power weighting)})
+                  (when-not (< 0.0 (double (:power weighting)) 1.000001)
+                    (throw (ex-info "augur.dynamic/averaged: :temper's :power must be in (0, 1]" weighting))))
+      (throw (ex-info "augur.dynamic/averaged: :weighting's :rule must be :stack or :temper" weighting))))
   (let [kinds (set (map :type (vals models)))]
     (when (not= 1 (count kinds))
       (throw (ex-info "augur.dynamic/averaged needs models of one kind" {:kinds kinds})))
-    {:type :averaged :kind (first kinds) :models models :forget (double forget)
-     :w (into {} (for [k (keys models)] [k (/ 1.0 (count models))]))}))
+    (cond-> {:type :averaged :kind (first kinds) :models models :forget (double forget)
+             :w (into {} (for [k (keys models)] [k (/ 1.0 (count models))]))}
+      weighting (assoc :weighting (if (= :stack (:rule weighting))
+                                    {:rule :stack :rate (double (:rate weighting)) :floor (double (:floor weighting))}
+                                    {:rule :temper :power (double (:power weighting))})))))
 
 (defn weights "Each model's weight after the last period." [avg] (:w avg))
 
 (defn- predict-averaged [{:keys [models w]} x offset]
   (reduce + (for [[k mdl] models] (* (w k) (predict mdl x offset)))))
 
-(defn- step-averaged [{:keys [models w forget] :as avg} rows]
+(defn- stacked-weights
+  "The weights after `rows` by exponentiated gradient on the mixture's log
+  score, each model's predictive from its state before the period, then
+  floored."
+  [models w {:keys [rate floor]} rows]
+  (let [ks (vec (keys models))
+        n (count ks)
+        w (loop [rows (seq rows) w w]
+            (if-not rows
+              w
+              (let [r (first rows)
+                    r1 (dissoc r :w)
+                    ps (into {} (for [k ks] [k (Math/exp (log-score (models k) [r1]))]))
+                    mix (Math/max 1e-300 (reduce + (for [k ks] (* (w k) (ps k)))))
+                    eta (* rate (double (or (:w r) 1.0)))
+                    ;; centred on the best ratio so the exponent stays bounded
+                    top (apply max (for [k ks] (/ (ps k) mix)))
+                    w (into {} (for [k ks] [k (* (w k) (Math/exp (* eta (- (/ (ps k) mix) top))))]))
+                    z (reduce + (vals w))]
+                (recur (next rows) (update-vals w #(/ % z))))))]
+    (update-vals w #(+ (* (- 1.0 floor) %) (/ floor n)))))
+
+(defn- step-averaged [{:keys [models w forget weighting] :as avg} rows]
+  (if (= :stack (:rule weighting))
+    (let [flat (into {} (for [[k v] w] [k (Math/pow v forget)]))
+          z (reduce + (vals flat))]
+      (assoc avg
+             :w (stacked-weights models (update-vals flat #(/ % z)) weighting rows)
+             :models (into {} (for [[k mdl] models] [k (step mdl rows)]))))
+    (step-posterior avg rows)))
+
+(defn- step-posterior [{:keys [models w forget] :as avg} rows]
   (let [flat (into {} (for [[k v] w] [k (Math/pow v forget)]))
         z (reduce + (vals flat))
         prior (update-vals flat #(/ % z))
@@ -389,7 +454,8 @@
                            [k (if (= :linear (:type mdl))
                                 (let [[mm c] (discounted mdl)] (linear-step mdl mm c rows))
                                 [nil (log-score mdl rows)])]))
-        ll (update-vals stepped second)
+        power (if (= :temper (:rule (:weighting avg))) (:power (:weighting avg)) 1.0)
+        ll (update-vals stepped #(* power (second %)))
         top (apply max (vals ll))
         post (into {} (for [[k p] prior] [k (* p (Math/exp (- (ll k) top)))]))
         z (reduce + (vals post))
