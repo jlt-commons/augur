@@ -62,6 +62,49 @@
   (let [t (t-of-mean (map - la lb) lags)]
     {:stat t :p (* 2.0 (phi-sf (Math/abs t)))}))
 
+(defn diebold-mariano-hln
+  "Diebold & Mariano on losses la and lb with Harvey, Leybourne & Newbold's
+  (1997) small-sample correction, one-sided: {:stat :p :n :mean}. The
+  statistic is the mean of la - lb over its Newey-West standard error
+  (`lags` Bartlett lags) times sqrt((n + 1 - 2h + h(h - 1)/n) / n), `h` the
+  forecast horizon in periods; p is P(T <= stat), T Student t(n - 1): small
+  when a's losses are lower. Losses that never differ, or too few of them
+  for the correction (n < 2, or its factor not positive), give p 1; a
+  difference of one sign with no spread gives p 0 (or 1)."
+  [la lb {:keys [h lags]}]
+  (let [d (mapv #(- (double %1) (double %2)) la lb)
+        n (count d)
+        h (long h)
+        k (when (>= n 2) (/ (+ n 1.0 (* -2.0 h) (/ (* h (dec h)) (double n))) n))]
+    (if (or (nil? k) (<= k 0.0))
+      {:stat Double/NaN :p 1.0 :n n :mean (when (pos? n) (/ (reduce + d) n))}
+      (let [mu (/ (reduce + d) (double n))
+            se (Math/sqrt (/ (max 0.0 (long-run-variance d (long lags))) n))]
+        (cond
+          (pos? se) (let [s (* (/ mu se) (Math/sqrt k))] {:stat s :p (t-cdf s (dec n)) :n n :mean mu})
+          (zero? mu) {:stat 0.0 :p 1.0 :n n :mean mu}
+          (neg? mu) {:stat Double/NEGATIVE_INFINITY :p 0.0 :n n :mean mu}
+          :else {:stat Double/POSITIVE_INFINITY :p 1.0 :n n :mean mu})))))
+
+(defn holm-adjusted
+  "Holm's (1979) step-down adjusted p-values, in the order given: the k-th
+  smallest p times (m - k + 1), made monotone, at most 1. Controls the
+  familywise error under any dependence between the tests."
+  [ps]
+  (let [m (count ps)
+        order (sort-by #(nth ps %) (range m))]
+    (loop [[i & more] order k 0 prev 0.0 acc (vec (repeat m 1.0))]
+      (if (nil? i)
+        acc
+        (let [a (min 1.0 (max prev (* (- m k) (double (nth ps i)))))]
+          (recur more (inc k) a (assoc acc i a)))))))
+
+(defn holm
+  "Which of the tests with p-values `ps` Holm's step-down rejects at
+  familywise level `alpha` (booleans, in the order given)."
+  [ps alpha]
+  (mapv #(<= % alpha) (holm-adjusted ps)))
+
 (defn pesaran-timmermann
   "Pesaran & Timmermann's test that forecasts f get the signs of y right
   more often than independent signs would: {:hit :stat :p}, p one-sided."

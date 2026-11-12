@@ -56,7 +56,7 @@ out as its own library.
 | `augur.enkf` | The ensemble Kalman filter's stochastic update (centred perturbations), derivative-free: the analysis of an ensemble of states and parameters, repeated with inflated noise for the ensemble smoother with multiple data assimilation; linear identities kept by projection onto them |
 | `augur.pool` | Combining forecasters: EM linear pools, Hedge weights, the log-odds median, a log-linear stack |
 | `augur.score` | AUC, average precision, recall at a budget, Brier, usefulness, area skill, matched concordance, paired bootstrap gains (one- and two-way), a risk-adjusted CUSUM, out-of-sample stacks and drift refits, the PIT and CRPS of a sample |
-| `augur.ftest` | Tests of forecasts: out-of-sample R², Clark-West, Diebold-Mariano, Pesaran-Timmermann, QLIKE, CRPS and log scores, Kupiec, Christoffersen, Berkowitz, Newey-West, Hansen's SPA |
+| `augur.ftest` | Tests of forecasts: out-of-sample R², Clark-West, Diebold-Mariano (and its small-sample one-sided form, Harvey-Leybourne-Newbold), Holm's step-down, Pesaran-Timmermann, QLIKE, CRPS and log scores, Kupiec, Christoffersen, Berkowitz, Newey-West, Hansen's SPA |
 | `augur.changepoint` | Bayesian online change-point detection, incremental (`init`, `step`) or over a series (`run`) |
 | `augur.trees` | Shallow gradient-boosted trees for probabilities |
 | `augur.analog` | Nearest-past-cases forecasts shrunk toward the base rate |

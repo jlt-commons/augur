@@ -37,6 +37,39 @@
       (is (= 0.5 p)))
     (is (= 1.0 (:p (fs/diebold-mariano [1.0 2.0 3.0] [1.0 2.0 3.0] 2))))))
 
+(deftest small-sample-diebold-mariano
+  ;; Harvey, Leybourne & Newbold (1997): DM times sqrt((n + 1 - 2h + h(h -
+  ;; 1)/n) / n) against Student t(n - 1); one-sided, p small when a's losses
+  ;; are lower. Expected from numpy and scipy.stats.t.
+  (let [la (map #(let [e (- %1 %2)] (* e e)) y f)
+        lb (map #(let [e (- %1 %2)] (* e e)) y b)]
+    (doseq [[h lags stat p] [[2 2 -0.5776170082010738 0.28286032704057834]
+                             [1 0 -0.4987250078918129 0.30991373718756926]
+                             [3 3 -0.5756642475202997 0.2835157122655628]]]
+      (let [r (fs/diebold-mariano-hln la lb {:h h :lags lags})]
+        (is (close? stat (:stat r)) [h lags r])
+        (is (close? p (:p r)) [h lags r])
+        (is (= 60 (:n r)))))
+    (testing "the other way round, the same statistic negated and the other tail"
+      (let [r (fs/diebold-mariano-hln lb la {:h 2 :lags 2})]
+        (is (close? 0.5776170082010738 (:stat r)))
+        (is (close? (- 1.0 0.28286032704057834) (:p r))))))
+  (testing "losses that never differ: nothing to test"
+    (is (= 1.0 (:p (fs/diebold-mariano-hln [1.0 2.0 3.0] [1.0 2.0 3.0] {:h 1 :lags 0})))))
+  (testing "a constant gain with no spread is a certain gain"
+    (is (= 0.0 (:p (fs/diebold-mariano-hln [1.0 1.0 1.0] [2.0 2.0 2.0] {:h 1 :lags 0})))))
+  (testing "too few losses for the correction (n + 1 - 2h + h(h-1)/n <= 0, or n < 2): no test"
+    (is (= 1.0 (:p (fs/diebold-mariano-hln [0.0] [1.0] {:h 1 :lags 0}))))
+    (is (= 1.0 (:p (fs/diebold-mariano-hln [0.0 0.1] [1.0 1.2] {:h 2 :lags 1}))))))
+
+(deftest holm-step-down
+  ;; statsmodels multipletests(method="holm") on the same p-values
+  (is (= [true false false true] (fs/holm [0.01 0.04 0.03 0.005] 0.05)))
+  (is (= [0.03 0.06 0.06 0.02] (mapv #(/ (Math/round (* 1e12 %)) 1e12) (fs/holm-adjusted [0.01 0.04 0.03 0.005]))))
+  (is (= [] (fs/holm [] 0.05)))
+  (testing "adjusted p never above 1"
+    (is (= [1.0 1.0] (fs/holm-adjusted [0.7 0.9])))))
+
 (deftest distributions
   (is (close? 0.024097654305104653 (fs/crps-normal 0.01 0.04 -0.03)))
   (is (< (Math/abs (- 0.024153222509929205 (fs/crps-t 0.01 0.04 5.0 -0.03))) 1e-8))
