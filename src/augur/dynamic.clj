@@ -34,7 +34,8 @@
   outcomes. The weights through time are each model's share of the
   evidence: what has mattered, and when that changed. Averaging over the
   same inputs at several discounts tunes the discount from experience."
-  (:require [augur.math :as m]))
+  (:require [augur.hier :as hier]
+            [augur.math :as m]))
 
 (set! *unchecked-math* true)
 
@@ -229,7 +230,7 @@
             (dotimes [j k]
               (aset c (+ (* i k) j) (- (aget c (+ (* i k) j)) (* (aget cx i) (aget cx j) shrink))))))))))
 
-(declare step-averaged step-averaged* predict-averaged step-posterior pooled-moments)
+(declare step-averaged step-averaged* predict-averaged step-posterior pooled-moments shared-score)
 
 (defn predict
   "The probability of the outcome (logistic), the expected count
@@ -305,6 +306,10 @@
   state. (An average weighs its linear models on their sequential
   evidence, each row given the ones before it.)"
   [state rows]
+  (if (and (not= :averaged (:type state)) (some :shared rows))
+    (shared-score (:type state) rows
+                  #(log-score state [(dissoc % :shared)])
+                  (fn [{:keys [x o]}] (let [[f q] (ahead state (pick state x) (double (or o 0.0)))] {:f f :q q})))
   (reduce + (for [{:keys [x y w o]} rows
                   :let [w (double (or w 1.0))
                         o (double (or o 0.0))]]
@@ -327,7 +332,7 @@
                   :poisson (let [[f q] (ahead state (pick state x) o)]
                              (* w (poisson-log-predictive f q (double y))))
                   :linear (let [[f q] (ahead state (pick state x) o)]
-                            (* w (linear-log-density (double y) f (+ q (:s state)) (:n state)))))))))
+                            (* w (linear-log-density (double y) f (+ q (:s state)) (:n state))))))))))
 
 (defn- linear-step
   "[state log-evidence] of a linear model after `rows`, its mean `mm` and
@@ -415,8 +420,77 @@
   [state]
   (:scales state))
 
+(defn- shared-groups
+  "`rows` split by their :shared effect: [[nil rows-without] [[id mean var]
+  rows] ...], the groups in order of first appearance; each group's
+  effect checked to be one [id mean var] with var >= 0."
+  [rows]
+  (let [order (distinct (keep #(some-> (:shared %) first) rows))
+        by (group-by #(some-> (:shared %) first) rows)]
+    (into [[nil (vec (by nil))]]
+          (for [id order
+                :let [rs (by id)
+                      effs (distinct (map :shared rs))
+                      [_ mean var :as eff] (first effs)]]
+            (do (when-not (and (= 1 (count effs)) (= 3 (count eff)) (number? mean) (number? var) (>= (double var) 0.0))
+                  (throw (ex-info "augur.dynamic: a shared effect is [id mean variance], one per id, the variance at least 0" {:shared (vec effs)})))
+                [eff rs])))))
+
+(defn- step-shared!
+  "Updates mm and c in place with rows some of which share an effect
+  (:shared [id mean var]: a term N(mean, var) common to every row with
+  that id, added to their linear predictors). The rows without one update
+  as `step` does; each group updates the state augmented by its effect,
+  which is then integrated out (the Gaussian marginal: the block of the
+  coefficients). A coefficient whose input is the same at every row of a
+  group (an intercept, an input common to the period) is confounded with
+  the effect within it, so it learns from the group about what one
+  observation of variance var would teach, not once per row."
+  [{:keys [type k] :as state} ^doubles mm ^doubles c rows]
+  (let [k (long k)
+        k1 (inc k)]
+    (doseq [[eff rs] (shared-groups rows)]
+      (if (nil? eff)
+        (doseq [{:keys [x y w o]} rs]
+          (update-row! type mm c k (pick state x) y (double (or w 1.0)) (double (or o 0.0))))
+        (let [[_ mean var] eff
+              m1 (double-array k1)
+              c1 (double-array (* k1 k1))]
+          (dotimes [i k] (aset m1 i (aget mm i)))
+          (aset m1 k (double mean))
+          (dotimes [i k] (dotimes [j k] (aset c1 (+ (* i k1) j) (aget c (+ (* i k) j)))))
+          (aset c1 (+ (* k k1) k) (double var))
+          (doseq [{:keys [x y w o]} rs]
+            (let [x0 (pick state x)
+                  x1 (double-array k1)]
+              (dotimes [i k] (aset x1 i (aget x0 i)))
+              (aset x1 k 1.0)
+              (update-row! type m1 c1 k1 x1 y (double (or w 1.0)) (double (or o 0.0)))))
+          (dotimes [i k] (aset mm i (aget m1 i)))
+          (dotimes [i k] (dotimes [j k] (aset c (+ (* i k) j) (aget c1 (+ (* i k1) j))))))))))
+
+(defn- shared-score
+  "The log score of `rows`, some sharing an effect: the rows without one
+  by `one` (fn [row] -> log probability), each group by its rows' log
+  marginal with the effect integrated (augur.hier/shared-marginal), each
+  row's predictive moments from `moments` (fn [row] -> {:f :q})."
+  [kind rows one moments]
+  (when (= :linear kind)
+    (throw (ex-info "augur.dynamic: a shared effect needs a logistic or Poisson model" {:kind kind})))
+  (reduce + 0.0 (for [[eff rs] (shared-groups rows)]
+                  (if (or (nil? eff) (and (zero? (double (nth eff 2))) (zero? (double (nth eff 1)))))
+                    ;; no effect, or one fixed at 0: the rows scored as they are
+                    (reduce + 0.0 (map one rs))
+                    (let [[_ mean var] eff]
+                      (:ll (hier/shared-marginal kind (for [r rs] (assoc (moments r) :y (:y r) :w (double (or (:w r) 1.0))))
+                                                 mean var)))))))
+
 (defn step
-  "The state after a period: discounted, then updated with each of `rows`."
+  "The state after a period: discounted, then updated with each of `rows`.
+  A row's :shared [id mean var] is a term common to every row of the
+  period with that id, N(mean, var) on the linear predictor (a period's
+  common shock): those rows are learned jointly with it and it is then
+  integrated out (logistic and Poisson models)."
   [state rows]
   (if (= :averaged (:type state))
     (step-averaged state rows)
@@ -424,8 +498,15 @@
           [mm c] (discounted state)
           scales (when gshrink (shrink-groups! mm c (long k) gshrink))
           state (cond-> state gshrink (assoc :scales scales))]
-      (if (= :linear type)
+      (cond
+        (and (= :linear type) (some :shared rows))
+        (throw (ex-info "augur.dynamic: a shared effect needs a logistic or Poisson model" {:type type}))
+        (= :linear type)
         (first (linear-step state mm c rows))
+        (some :shared rows)
+        (do (step-shared! state mm c rows)
+            (assoc state :m mm :c c))
+        :else
         (do (doseq [{:keys [x y w o]} rows]
               (update-row! type mm c k (pick state x) y (double (or w 1.0)) (double (or o 0.0))))
             (assoc state :m mm :c c))))))
@@ -580,7 +661,11 @@
   [{:keys [models kind] :as avg} rows]
   (if (issue? avg)
     (into {} (for [k (keys models)]
-                [k (reduce + 0.0 (for [r rows] (issued-score kind (issued-of r k) (:y r) (double (or (:w r) 1.0)))))]))
+                [k (if (some :shared rows)
+                     (shared-score kind rows
+                                   #(issued-score kind (issued-of % k) (:y %) (double (or (:w %) 1.0)))
+                                   #(select-keys (issued-of % k) [:f :q]))
+                     (reduce + 0.0 (for [r rows] (issued-score kind (issued-of r k) (:y r) (double (or (:w r) 1.0))))))]))
     (into {} (for [[k mdl] models]
                [k (if (= :linear (:type mdl))
                     (let [[mm c] (discounted mdl)] (second (linear-step mdl mm c rows)))

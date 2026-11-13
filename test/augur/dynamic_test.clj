@@ -620,3 +620,75 @@
         (is (every? #(< (Math/abs (- (now %) (learned %))) 1e-12) [:base :b]) [now learned])))
     (is (thrown? clojure.lang.ExceptionInfo (d/step avg [{:x x :y true}])) "a row without its issued predictive")
     (is (thrown? clojure.lang.ExceptionInfo (d/averaged (two-models) {:forget 0.99 :evidence-at :later})))))
+
+;; --- shared effects: one period's rows sharing a common shock ---------------
+
+(defn- shock-periods
+  "T periods of n rows each: an intercept and a time-common input w_t (the
+  same at every row of a period) that carries nothing, the outcomes moved
+  by a period shock N(0, s^2) common to the period's rows. With `shared`,
+  each row carries the period's shared effect [t 0 s^2]."
+  [seed T n s shared]
+  (let [g (m/rng seed)]
+    (vec (for [t (range T)]
+           (let [w (m/normal! g)
+                 z (* s (m/normal! g))]
+             (vec (for [_ (range n)]
+                    (cond-> {:x [1.0 w] :y (< (m/next-double! g) (m/expit (+ -1.0 z)))}
+                      shared (assoc :shared [t 0.0 (* s s)])))))))))
+
+(defn- coef-var [state i] (aget ^doubles (:c state) (+ (* i (:k state)) i)))
+
+(deftest a-shared-effect-counts-a-period-once-for-time-common-inputs
+  (let [fresh (d/logistic {:mean [0.0 0.0] :var [4.0 1.0] :discount 1.0})
+        after (fn [n shared] (run fresh (shock-periods 3 40 n 1.0 shared)))]
+    (testing "rows read as independent: 500 rows a period teach a time-common slope ten times what 50 do"
+      (is (> (/ (coef-var (after 50 false) 1) (coef-var (after 500 false) 1)) 5.0)))
+    (testing "with the period's shock shared, a period teaches it at most one observation of the shock's variance, however many rows"
+      (let [r (/ (coef-var (after 50 true) 1) (coef-var (after 500 true) 1))]
+        (is (< r 1.5) r))
+      (is (> (coef-var (after 500 true) 1) (/ 1.0 (+ 1.0 40.0 (* 3.0 40.0)))) "about 1/(1 + 40 w^2) after 40 periods"))
+    (testing "and the spurious slope stays near zero"
+      (is (< (Math/abs (nth (d/means (after 50 true)) 1)) 0.5) (d/means (after 50 true))))))
+
+(deftest a-shared-effect-of-zero-variance-changes-nothing
+  (let [fresh (d/logistic {:mean [0.0 0.0] :var [4.0 1.0] :discount 0.99})
+        plain (shock-periods 4 10 20 1.0 false)
+        zero (mapv (fn [rs] (mapv #(assoc % :shared [:p 0.0 0.0]) rs)) plain)
+        a (run fresh plain) b (run fresh zero)]
+    (is (every? #(< (Math/abs (double %)) 1e-12) (map - (d/means a) (d/means b))))
+    (is (every? #(< (Math/abs (double %)) 1e-12) (map - (vec (:c a)) (vec (:c b)))))
+    (is (< (Math/abs (- (d/log-score fresh (first plain)) (d/log-score fresh (first zero)))) 1e-9))))
+
+(deftest a-shared-shock-is-one-observation-of-evidence
+  ;; a period where every row has the event against a model at p = 0.27:
+  ;; scored independently its evidence grows with the rows; with the shock
+  ;; shared, the shock is paid for once, so the gap grows with n
+  (let [mdl (d/logistic {:mean [-1.0] :var [1e-6] :discount 1.0})
+        period (fn [n shared] (vec (for [_ (range n)] (cond-> {:x [1.0] :y true} shared (assoc :shared [:t 0.0 1.0])))))
+        gap (fn [n] (- (d/log-score mdl (period n true)) (d/log-score mdl (period n false))))]
+    (is (pos? (gap 50)))
+    (is (> (gap 100) (* 1.8 (gap 50))) [(gap 50) (gap 100)])
+    (testing "the shared score per row approaches the shock's, not the model's"
+      (is (> (/ (d/log-score mdl (period 200 true)) 200) -0.1)))))
+
+(deftest averaging-weighs-a-shared-shock-once
+  ;; two models that differ only in a time-common slope; one shocked period
+  ;; that the slope happens to fit. Read as 100 independent rows it locks
+  ;; the weights; shared, it moves them about as one row of evidence would
+  (let [a (d/logistic {:mean [-1.0 0.0] :var [1e-6 1e-6] :discount 1.0})
+        b (d/logistic {:mean [-1.0 1.0] :var [1e-6 1e-6] :discount 1.0})
+        rows (fn [shared] (vec (for [i (range 100)] (cond-> {:x [1.0 1.5] :y (< i 60)} shared (assoc :shared [:t 0.0 1.0])))))
+        w (fn [shared] (:b (d/weights (d/step (d/averaged {:a a :b b} {:forget 1.0}) (rows shared)))))]
+    (is (> (w false) 0.999))
+    (is (< (w true) 0.9) (w true))
+    (testing "and under :evidence-at :issue the same, from the issued predictives"
+      (let [avg (d/averaged {:a a :b b} {:forget 1.0 :evidence-at :issue})
+            rs (mapv #(assoc % :issued (d/issued avg (:x %) 0.0)) (rows true))]
+        (is (< (:b (d/weights (d/step avg rs))) 0.9))))))
+
+(deftest a-shared-effect-is-refused-for-linear-models
+  (is (thrown? clojure.lang.ExceptionInfo
+               (d/step (d/linear {:mean [0.0] :var [1.0] :discount 1.0}) [{:x [1.0] :y 1.0 :shared [:t 0.0 1.0]}])))
+  (is (thrown? clojure.lang.ExceptionInfo
+               (d/step (d/logistic {:mean [0.0] :var [1.0] :discount 1.0}) [{:x [1.0] :y true :shared [:t 0.0 -1.0]}]))))

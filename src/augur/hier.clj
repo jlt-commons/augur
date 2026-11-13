@@ -596,3 +596,72 @@
                                                 width))))]
                     (Math/exp (- total))))]
     (- 1.0 (/ (reduce + survive) (double draws)))))
+
+;; --- one shared state, online ------------------------------------------------
+
+(defn- shared-terms
+  "[log p, d/dz, -d2/dz2] of one row at shift z: a logistic row's outcome
+  under the predictive N(f, q) of its log odds, shifted by z (MacKay's
+  probit approximation, as augur.dynamic predicts), or a Poisson count
+  whose log rate is N(f + z, q)."
+  [kind {:keys [f q y w]} ^double z]
+  (let [f (double f) q (double (or q 0.0)) w (double (or w 1.0))]
+    (case kind
+      :logistic (let [k (/ 1.0 (Math/sqrt (+ 1.0 (/ (* Math/PI q) 8.0))))
+                      e (* k (+ f z))
+                      yy (if (if (number? y) (pos? (double y)) (boolean y)) 1.0 0.0)
+                      p (m/expit e)
+                      lp (- (* yy e) (if (> e 0.0) (+ e (Math/log1p (Math/exp (- e)))) (Math/log1p (Math/exp e))))]
+                  [(* w lp) (* w k (- yy p)) (* w k k p (- 1.0 p))])
+      :poisson (let [eta (+ f z (* 0.5 q))
+                     mu (Math/exp (Math/min 700.0 eta))
+                     yy (double y)]
+                 [(* w (- (* yy eta) mu (m/log-gamma (+ 1.0 yy)))) (* w (- yy mu)) (* w mu)])
+      (throw (ex-info "augur.hier: a shared state reads :logistic or :poisson rows" {:kind kind})))))
+
+(defn shared-marginal
+  "One period's rows sharing a state z ~ N(m, v), added to each row's
+  linear predictor: {:z the posterior mode, :v its variance, :ll the log
+  marginal likelihood of the rows with z integrated out} by Laplace's
+  approximation (Newton to the mode). Rows {:f :q :y :w}: the predictive
+  moments of each row's linear predictor without z, its outcome and
+  weight; `kind` :logistic or :poisson. With v = 0 the rows are scored at
+  z = m, independently. Scored jointly, a shock the rows share is paid for
+  once, through z, rather than once per row."
+  [kind rows m v]
+  (let [m (double m) v (double v)
+        sum (fn [z] (reduce (fn [[a b c] r] (let [[x y u] (shared-terms kind r z)] [(+ a x) (+ b y) (+ c u)]))
+                            [0.0 0.0 0.0] rows))]
+    (when (neg? v) (throw (ex-info "augur.hier/shared-marginal: a negative variance" {:v v})))
+    (if (or (zero? v) (empty? rows))
+      {:z m :v v :ll (double (first (sum m)))}
+      (let [z (loop [i 0 z m]
+                (let [[_ g h] (sum z)
+                      g (- (double g) (/ (- z m) v))
+                      h (+ (double h) (/ 1.0 v))
+                      z' (+ z (Math/max -5.0 (Math/min 5.0 (/ g h))))]
+                  (if (or (>= i 100) (< (Math/abs (- z' z)) 1e-10)) z' (recur (inc i) z'))))
+            [l _ h] (sum z)
+            d (- z m)]
+        {:z z :v (/ 1.0 (+ (double h) (/ 1.0 v)))
+         :ll (- (double l) (/ (* d d) (* 2.0 v)) (* 0.5 (Math/log1p (* v (double h)))))}))))
+
+(defn states-predict
+  "A single AR(1) state {:m :v} run h periods forward under {:rho :sd}
+  (sd the stationary sd): mean rho^h m, variance rho^2h v + sd^2 (1 -
+  rho^2h)."
+  [{:keys [m v]} {:keys [rho sd]} h]
+  (let [rh (Math/pow (double rho) (double h))
+        s2 (* (double sd) (double sd))]
+    {:m (* rh (double m)) :v (+ (* rh rh (double v)) (* s2 (- 1.0 (* rh rh))))}))
+
+(defn states-step
+  "One online step of a single shared state (the dynamic frailty of
+  `states`, one node and one period at a time, its rho and sd fixed): the
+  state's prior for the period {:m :v} (from `states-predict`) updated by
+  the period's rows (see `shared-marginal`; :kind :logistic or :poisson).
+  {:m :v :ll}, :ll the rows' log marginal under the prior: the period's
+  prequential score of the prior."
+  [{:keys [m v]} rows {:keys [kind] :or {kind :logistic}}]
+  (let [{z :z vz :v ll :ll} (shared-marginal kind rows m v)]
+    {:m z :v vz :ll ll}))

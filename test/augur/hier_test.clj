@@ -215,3 +215,47 @@
 
 (deftest grouped-slopes-refuse-without-options
   (is (thrown? Exception (h/grouped-slopes (grouped-rows 1 ["a"] 10 {}) 3 {:prior 1.0}))))
+
+;; --- one online step of a shared state ---------------------------------------
+
+(deftest states-step-filters-a-common-shock-online
+  ;; 80 places a period, a shared AR(1) log-odds shock; each period the
+  ;; state is predicted, then updated from the period's rows against a
+  ;; model that knows the places' own terms
+  (let [g (m/rng 11)
+        par {:rho 0.8 :sd 0.7}
+        T 80
+        zs (vec (take T (iterate #(+ (* 0.8 %) (* 0.7 (Math/sqrt (- 1.0 0.64)) (m/normal! g))) 0.0)))
+        fs (vec (repeatedly 80 #(- (m/normal! g) 1.5)))
+        steps (reductions (fn [st t]
+                            (let [prior (h/states-predict st par 1)
+                                  rows (for [f fs] {:f f :q 0.0 :y (< (m/next-double! g) (m/expit (+ f (zs t))))})]
+                              (h/states-step prior rows {:kind :logistic})))
+                          {:m 0.0 :v (* 0.7 0.7)} (range T))
+        ms (mapv :m (rest steps))]
+    (is (> (corr ms zs) 0.85) (corr ms zs))
+    (testing "the posterior is tighter than the prior, and the log marginal finite"
+      (is (every? #(< (:v %) 0.49) (rest steps)))
+      (is (every? #(< (Math/abs (double (:ll %))) 1e9) (rest steps))))))
+
+(deftest states-predict-runs-the-ar1-forward
+  (let [p (h/states-predict {:m 1.0 :v 0.0} {:rho 0.5 :sd 1.0} 2)]
+    (is (< (Math/abs (- (:m p) 0.25)) 1e-12))
+    (is (< (Math/abs (- (:v p) (- 1.0 0.0625))) 1e-12)))
+  (testing "a state of size zero stays at zero, and its step reads the rows at the prior"
+    (let [p (h/states-predict {:m 0.0 :v 0.0} {:rho 0.9 :sd 0.0} 3)
+          s (h/states-step p [{:f -1.0 :q 0.0 :y true}] {:kind :logistic})]
+      (is (= 0.0 (:m s) (:v s)))
+      (is (< (Math/abs (- (:ll s) (Math/log (m/expit -1.0)))) 1e-12)))))
+
+(deftest shared-marginal-matches-quadrature
+  ;; the Laplace marginal against a fine quadrature of the same integral
+  (let [rows (vec (for [i (range 12)] {:f (- (* 0.1 i) 1.5) :q 0.2 :y (even? i)}))
+        lik (fn [z] (reduce + (for [{:keys [f q y]} rows
+                                    :let [p (m/expit (/ (+ f z) (Math/sqrt (+ 1.0 (/ (* Math/PI q) 8.0)))))]]
+                                (Math/log (if y p (- 1.0 p))))))
+        v 0.6
+        dz 0.001
+        quad (Math/log (reduce + (for [i (range -8000 8000) :let [z (* i dz)]]
+                                   (* dz (Math/exp (lik z)) (/ (Math/exp (- (/ (* z z) (* 2 v)))) (Math/sqrt (* 2 Math/PI v)))))))]
+    (is (< (Math/abs (- quad (:ll (h/shared-marginal :logistic rows 0.0 v)))) 0.02))))
