@@ -606,6 +606,17 @@
   across a period's many rows is paid or rewarded for that uncertainty
   once per row.
 
+  :evidence-at :issue-joint scores what each model issued, jointly: per
+  origin (the rows carrying one :issue-state, from `issue-state` when
+  their forecasts were issued), the log marginal of the origin's rows
+  under the model's coefficients as they stood then and any effect the
+  rows share as issued, integrated over all the rows together
+  (`joint-score`). So the evidence is the issued forecast's prequential
+  score, with no hindsight (:issue) and no uncertainty paid once per row
+  (:sequential, but at issue). Rows need :issued and :issue-state. The
+  :stack and :synth rules, which read each row on its own, read :issued
+  as under :issue.
+
   :prior {name share} starts the weights from those shares instead of
   equal ones, the models not named sharing the rest evenly, and the
   forgetting flattens the weights toward them (w^forget prior^(1 -
@@ -614,8 +625,8 @@
   before."
   [models {:keys [forget weighting prior evidence-at]}]
   (need :averaged {:forget forget})
-  (when-not (contains? #{nil :learn :issue :sequential} evidence-at)
-    (throw (ex-info "augur.dynamic/averaged: :evidence-at must be :learn, :issue or :sequential" {:evidence-at evidence-at})))
+  (when-not (contains? #{nil :learn :issue :sequential :issue-joint} evidence-at)
+    (throw (ex-info "augur.dynamic/averaged: :evidence-at must be :learn, :issue, :sequential or :issue-joint" {:evidence-at evidence-at})))
   (when-let [bad (seq (remove (set (keys models)) (keys prior)))]
     (throw (ex-info "augur.dynamic/averaged: :prior names a model that is not averaged" {:models (vec bad)})))
   (when (or (some #(neg? (double %)) (vals prior)) (> (reduce + 0.0 (vals prior)) 1.000001))
@@ -641,6 +652,7 @@
              :w (into {} (for [k (keys models)] [k (/ 1.0 (count models))]))}
       (= :issue evidence-at) (assoc :evidence-at :issue)
       (= :sequential evidence-at) (assoc :evidence-at :sequential)
+      (= :issue-joint evidence-at) (assoc :evidence-at :issue-joint)
       (seq prior) (as-> avg (let [named (reduce + 0.0 (map double (vals prior)))
                                   others (- (count models) (count prior))
                                   pi (into {} (for [k (keys models)]
@@ -691,7 +703,7 @@
       (throw (ex-info "augur.dynamic: :evidence-at :issue needs each row's :issued predictive for every model"
                       {:model k :row (dissoc row :issued)}))))
 
-(defn- issue? [avg] (= :issue (:evidence-at avg)))
+(defn- issue? [avg] (contains? #{:issue :issue-joint} (:evidence-at avg)))
 
 (defn- score-row!
   "The weighted log predictive of one row under (mm, c), c already
@@ -748,6 +760,234 @@
              (dotimes [i k] (dotimes [j k] (aset ^doubles c (+ (* i k) j) (aget c1 (+ (* i kd) j)))))
              ll)))))))
 
+(defn- chol-psd!
+  "Overwrites the p x p symmetric positive semi-definite `a` (row major)
+  with its lower Cholesky factor L, a L L' = a. A pivot at or below 1e-13
+  of the largest diagonal (a direction of no variance) zeroes its column,
+  so a singular a is factored rather than refused."
+  [^doubles a ^long p]
+  (let [top (loop [i 0 mx 0.0] (if (< i p) (recur (inc i) (Math/max mx (aget a (+ (* i p) i)))) mx))
+        eps (* 1e-13 (Math/max 1e-300 top))]
+    (dotimes [j p]
+      (let [d (loop [s 0 acc (aget a (+ (* j p) j))]
+                (if (< s j) (recur (inc s) (- acc (* (aget a (+ (* j p) s)) (aget a (+ (* j p) s))))) acc))]
+        (if (> d eps)
+          (let [ljj (Math/sqrt d)]
+            (aset a (+ (* j p) j) ljj)
+            (loop [i (inc j)]
+              (when (< i p)
+                (let [v (loop [s 0 acc (aget a (+ (* i p) j))]
+                          (if (< s j) (recur (inc s) (- acc (* (aget a (+ (* i p) s)) (aget a (+ (* j p) s))))) acc))]
+                  (aset a (+ (* i p) j) (/ v ljj)))
+                (recur (inc i)))))
+          (loop [i j] (when (< i p) (aset a (+ (* i p) j) 0.0) (recur (inc i))))))
+      ;; the upper triangle zeroed
+      (loop [i 0] (when (< i j) (aset a (+ (* i p) j) 0.0) (recur (inc i)))))
+    a))
+
+(defn- spd-solve-logdet
+  "[x log|a|] for a symmetric positive definite p x p `a` (row major, left
+  unchanged) and b."
+  [^doubles a ^long p ^doubles b]
+  (let [l (chol-psd! (aclone a) p)
+        y (double-array p)
+        x (double-array p)]
+    (dotimes [i p]
+      (aset y i (/ (loop [s 0 acc (aget b i)] (if (< s i) (recur (inc s) (- acc (* (aget l (+ (* i p) s)) (aget y s)))) acc))
+                   (aget l (+ (* i p) i)))))
+    (loop [i (dec p)]
+      (when (>= i 0)
+        (aset x i (/ (loop [s (inc i) acc (aget y i)] (if (< s p) (recur (inc s) (- acc (* (aget l (+ (* s p) i)) (aget x s)))) acc))
+                     (aget l (+ (* i p) i))))
+        (recur (dec i))))
+    [x (* 2.0 (loop [i 0 acc 0.0] (if (< i p) (recur (inc i) (+ acc (Math/log (aget l (+ (* i p) i))))) acc)))]))
+
+(defn- row-terms
+  "[log p, d/deta, -d2/deta2] of one row's outcome y at linear predictor
+  eta (a logistic or Poisson likelihood), times its weight w."
+  [type ^double eta y ^double w]
+  (case type
+    :logistic (let [yy (if (event? y) 1.0 0.0)
+                    p (m/expit eta)]
+                [(loglik :logistic eta y w) (* w (- yy p)) (* w p (- 1.0 p))])
+    :poisson (let [mu (Math/exp (Math/min 700.0 eta))
+                   yy (double y)]
+               [(* w (- (* yy eta) mu (m/log-gamma (+ 1.0 yy)))) (* w (- yy mu)) (* w mu)])))
+
+(defn joint-score
+  "The log marginal probability of one origin's `rows` under the joint
+  predictive a logistic or Poisson `state` issued for them: the
+  coefficients N(m, C), discounted as `step` will (the state as it stood
+  when the rows' forecasts were issued), and any shared effect each row
+  carries (:shared [id mean var], with :load for one of several
+  dimensions, as `step`), integrated jointly over all the rows, not row by
+  row. One origin is then one draw of the coefficients and of each shared
+  effect, so their uncertainty is paid or rewarded once for the origin
+  however many rows it has.
+
+  Laplace's approximation in the coefficients and the shared effects
+  together, theta ~ N(mu, S) with S = diag(C, var...): with S = L L' and
+  theta = mu + L v, the rows' log likelihood less v'v/2 is maximized in v
+  by damped Newton, and the log marginal is its maximum less half log|I +
+  Z'WZ| (Z the rows' inputs times L, W the likelihood's curvature at the
+  mode). It costs a p x p system a step, p the coefficients and shared
+  dimensions, whatever the rows; a singular S (a dimension known exactly)
+  needs no inverse.
+
+  Rows {:x :y :w :o}, and the issued moments :f :q of each row's linear
+  predictor (offset included, shared effect excluded) when the forecast
+  was issued at something other than x'm + o: each row's mean is then the
+  one at which its predictive under the coefficients' variance x'Cx gives
+  the probability (logistic, MacKay's probit approximation) or the
+  expected count (Poisson) the issued moments do, so a row issued over a
+  mixture of offsets (:q 0, :f the mixture's log odds) is scored at what
+  was issued, and a row issued at x'm + o is scored at f exactly."
+  [{:keys [type k] :as state} rows]
+  (when-not (#{:logistic :poisson} type)
+    (throw (ex-info "augur.dynamic/joint-score: a logistic or Poisson model" {:type type})))
+  (let [rows (vec rows)
+        n (count rows)
+        k (long k)
+        [mm c] (discounted state)
+        ^doubles mm mm ^doubles c c
+        ;; the shared effects: each id's block of dimensions after the coefficients
+        groups (rest (shared-groups rows))
+        blocks (loop [gs groups at k out {}]
+                 (if-let [[[id mean var] _] (first gs)]
+                   (let [d (if (sequential? mean) (count mean) 1)]
+                     (recur (rest gs) (+ at d) (assoc out id [at d mean var])))
+                   out))
+        p (long (+ k (reduce + 0 (map (fn [[_ d]] d) (vals blocks)))))
+        s (double-array (* p p))]
+    (dotimes [i k] (dotimes [j k] (aset s (+ (* i p) j) (aget c (+ (* i k) j)))))
+    (doseq [[_ [at d _ var]] blocks]
+      (let [at (long at) d (long d)]
+        (dotimes [a d]
+          (dotimes [b d]
+            (aset s (+ (* (+ at a) p) (+ at b))
+                  (double (if (sequential? var) (nth (nth var a) b) var)))))))
+    (let [l (chol-psd! s p)
+          z (double-array (* n p))
+          big-f (double-array n)
+          ws (double-array n)]
+      (dotimes [r n]
+        (let [{:keys [x o w f q shared load]} (nth rows r)
+              x0 (pick state x)
+              xt (double-array p)
+              _ (dotimes [i k] (aset xt i (aget ^doubles x0 i)))
+              shift (if shared
+                      (let [[at d mean] (blocks (first shared))
+                            at (long at) d (long d)]
+                        (loop [a 0 acc 0.0]
+                          (if (< a d)
+                            (let [ld (if (sequential? mean) (double (nth load a)) 1.0)]
+                              (aset xt (+ at a) ld)
+                              (recur (inc a) (+ acc (* ld (double (if (sequential? mean) (nth mean a) mean))))))
+                            acc)))
+                      0.0)
+              [f0 qc] (moments mm c k x0 (double (or o 0.0)) 1.0)
+              f0 (double f0) qc (double qc)
+              fr (if (nil? f)
+                   f0
+                   (let [f (double f) q (double (or q qc))]
+                     (if (<= (Math/abs (- q qc)) (* 1e-9 (+ 1.0 q)))
+                       f
+                       (case type
+                         :logistic (* f (Math/sqrt (/ (+ 1.0 (/ (* Math/PI qc) 8.0)) (+ 1.0 (/ (* Math/PI q) 8.0)))))
+                         :poisson (+ f (* 0.5 (- q qc)))))))]
+          (aset big-f r (+ (double fr) (double shift)))
+          (aset ws r (double (or w 1.0)))
+          ;; z_r = L' xt
+          (dotimes [a p]
+            (aset z (+ (* r p) a)
+                  (loop [b a acc 0.0] (if (< b p) (recur (inc b) (+ acc (* (aget xt b) (aget l (+ (* b p) a))))) acc))))))
+      (let [eval-at (fn [^doubles v]
+                      ;; [log lik less v'v/2, its gradient in v, I + Z'WZ]
+                      (let [g (double-array p)
+                            a (double-array (* p p))]
+                        (dotimes [i p] (aset a (+ (* i p) i) 1.0))
+                        (let [ll (loop [r 0 acc 0.0]
+                                   (if (< r n)
+                                     (let [off (* r p)
+                                           eta (+ (aget big-f r) (loop [i 0 e 0.0] (if (< i p) (recur (inc i) (+ e (* (aget z (+ off i)) (aget v i)))) e)))
+                                           [lr gr hr] (row-terms type eta (:y (nth rows r)) (aget ws r))
+                                           gr (double gr) hr (double hr)]
+                                       (dotimes [i p]
+                                         (let [zi (aget z (+ off i))]
+                                           (when-not (zero? zi)
+                                             (aset g i (+ (aget g i) (* gr zi)))
+                                             (let [hz (* hr zi)]
+                                               (loop [j 0]
+                                                 (when (<= j i)
+                                                   (aset a (+ (* i p) j) (+ (aget a (+ (* i p) j)) (* hz (aget z (+ off j)))))
+                                                   (recur (inc j))))))))
+                                       (recur (inc r) (+ acc (double lr))))
+                                     acc))]
+                          (dotimes [i p]
+                            (aset g i (- (aget g i) (aget v i)))
+                            (loop [j 0] (when (< j i) (aset a (+ (* j p) i) (aget a (+ (* i p) j))) (recur (inc j)))))
+                          [(- ll (* 0.5 (loop [i 0 acc 0.0] (if (< i p) (recur (inc i) (+ acc (* (aget v i) (aget v i)))) acc)))) g a])))
+            obj (fn [^doubles v]
+                  (- (loop [r 0 acc 0.0]
+                       (if (< r n)
+                         (let [off (* r p)
+                               eta (+ (aget big-f r) (loop [i 0 e 0.0] (if (< i p) (recur (inc i) (+ e (* (aget z (+ off i)) (aget v i)))) e)))]
+                           (recur (inc r) (+ acc (double (first (row-terms type eta (:y (nth rows r)) (aget ws r)))))))
+                         acc))
+                     (* 0.5 (loop [i 0 acc 0.0] (if (< i p) (recur (inc i) (+ acc (* (aget v i) (aget v i)))) acc)))))
+            ;; damped Newton: each step cut to a length of 5 and halved until
+            ;; the objective does not fall (it is concave, so this converges)
+            v (loop [it 0 v (double-array p)]
+                (let [[f0 g a] (eval-at v)
+                      [dx _] (spd-solve-logdet a p g)
+                      ^doubles dx dx
+                      big (loop [i 0 mx 0.0] (if (< i p) (recur (inc i) (Math/max mx (Math/abs (aget dx i)))) mx))
+                      cut (if (> big 5.0) (/ 5.0 big) 1.0)
+                      f0 (double f0)
+                      tol (* 1e-12 (+ 1.0 (Math/abs f0)))
+                      step (loop [t cut]
+                             (let [v' (double-array p)]
+                               (dotimes [i p] (aset v' i (+ (aget v i) (* t (aget dx i)))))
+                               (cond (>= (double (obj v')) (- f0 tol)) [t v']
+                                     (< t 1e-8) nil
+                                     :else (recur (* 0.5 t)))))]
+                  (if-let [[t v'] step]
+                    (if (or (>= it 100) (< (* (double t) big) 1e-10)) v' (recur (inc it) v'))
+                    v)))
+            [f* _ a] (eval-at v)
+            [_ logdet] (spd-solve-logdet a p (double-array p))]
+        (- (double f*) (* 0.5 (double logdet)))))))
+
+(defn issue-state
+  "What an average's models are when a forecast is issued, {name state}:
+  each row carries it as :issue-state, beside its :issued predictives,
+  for :evidence-at :issue-joint (the same value for every row of an
+  origin)."
+  [avg]
+  (:models avg))
+
+(defn- by-origin
+  "`rows` grouped by their :issue-state, one group per state (compared by
+  identity), in order of first appearance."
+  [rows]
+  (reduce (fn [groups r]
+            (let [st (or (:issue-state r)
+                         (throw (ex-info "augur.dynamic: :evidence-at :issue-joint needs each row's :issue-state" {:row (dissoc r :issued)})))
+                  i (first (keep-indexed (fn [i [s _]] (when (identical? s st) i)) groups))]
+              (if i (update-in groups [i 1] conj r) (conj groups [st [r]]))))
+          [] rows))
+
+(defn- joint-evidence
+  "Each model's evidence under :evidence-at :issue-joint: per origin, the
+  joint log marginal of its rows under the state the model issued them
+  from, each row's mean at what it issued."
+  [{:keys [models]} rows]
+  (let [origins (by-origin rows)]
+    (into {} (for [k (keys models)]
+               [k (reduce + 0.0 (for [[st rs] origins]
+                                  (joint-score (or (get st k) (throw (ex-info "augur.dynamic: an :issue-state without the model" {:model k})))
+                                               (for [r rs] (let [{:keys [f q]} (issued-of r k)] (assoc r :f f :q q))))))]))))
+
 (defn- learn-score
   "A model's evidence from a period's rows at learn time: each row given
   the ones before it under :evidence-at :sequential (a logistic or
@@ -765,13 +1005,17 @@
   :evidence-at :sequential every model's). What the averaging weighs the
   models by."
   [{:keys [models kind] :as avg} rows]
-  (if (issue? avg)
+  (cond
+    (= :issue-joint (:evidence-at avg))
+    (joint-evidence avg rows)
+    (issue? avg)
     (into {} (for [k (keys models)]
                 [k (if (some :shared rows)
                      (shared-score kind rows
                                    #(issued-score kind (issued-of % k) (:y %) (double (or (:w %) 1.0)))
                                    #(select-keys (issued-of % k) [:f :q]))
                      (reduce + 0.0 (for [r rows] (issued-score kind (issued-of r k) (:y r) (double (or (:w r) 1.0))))))]))
+    :else
     (into {} (for [[k mdl] models]
                [k (if (= :linear (:type mdl))
                     (let [[mm c] (discounted mdl)] (second (linear-step mdl mm c rows)))

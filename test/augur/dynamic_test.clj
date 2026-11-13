@@ -809,5 +809,176 @@
             w (d/weights (d/step two rows))]
         (is (< (Math/abs (- (/ (w :b) (w :a)) (Math/exp (- (e :b) (e :a))))) 1e-6))))))
 
-(deftest evidence-at-takes-learn-issue-or-sequential
+(deftest evidence-at-takes-learn-issue-sequential-or-issue-joint
   (is (thrown? clojure.lang.ExceptionInfo (d/averaged {:a (d/logistic {:mean [0.0] :var [1.0] :discount 1.0})} {:forget 1.0 :evidence-at :joint}))))
+
+;; --- :evidence-at :issue-joint: the joint predictive each model issued for an origin ---
+
+(defn- chol-lower
+  "The lower Cholesky factor of a small positive semi-definite matrix."
+  [a]
+  (let [p (count a)]
+    (reduce (fn [l j]
+              (let [dd (- (get-in a [j j]) (reduce + 0.0 (for [s (range j)] (let [x (get-in l [j s])] (* x x)))))
+                    ljj (Math/sqrt (max dd 0.0))
+                    l (assoc-in l [j j] ljj)]
+                (reduce (fn [l i] (assoc-in l [i j] (if (pos? ljj)
+                                                      (/ (- (get-in a [i j]) (reduce + 0.0 (for [s (range j)] (* (get-in l [i s]) (get-in l [j s]))))) ljj)
+                                                      0.0)))
+                        l (range (inc j) p))))
+            (vec (repeat p (vec (repeat p 0.0)))) (range p))))
+
+(defn- quadrature
+  "The log marginal of outcomes ys at inputs xs under theta ~ N(mu, S), by
+  brute force: theta = mu + L v on a grid of 41 points over [-6, 6] in
+  each of v's dimensions (the trapezoid rule, spectrally accurate for a
+  smooth integrand against a Gaussian)."
+  [type mu S xs ys]
+  (let [p (count mu) L (chol-lower S)
+        npts 41 lim 6.0
+        h (/ (* 2.0 lim) (dec npts))
+        grid (vec (for [i (range npts)] (+ (- lim) (* i h))))
+        wts (mapv #(* h (/ (Math/exp (* -0.5 % %)) (Math/sqrt (* 2 Math/PI)))) grid)
+        idx (fn idx [dm] (if (zero? dm) [[]] (for [i (range npts) r (idx (dec dm))] (cons i r))))
+        ll (fn [eta y] (case type
+                         :logistic (if y (- eta (Math/log1p (Math/exp eta))) (- (Math/log1p (Math/exp eta))))
+                         :poisson (- (* y eta) (Math/exp eta) (m/log-gamma (+ 1.0 y)))))]
+    (Math/log
+     (reduce + 0.0 (for [ii (idx p)]
+                     (let [v (mapv grid ii)
+                           th (mapv (fn [a] (+ (mu a) (reduce + 0.0 (for [b (range p)] (* (get-in L [a b]) (v b)))))) (range p))]
+                       (* (reduce * (map wts ii))
+                          (Math/exp (reduce + 0.0 (map (fn [x y] (ll (reduce + 0.0 (map * x th)) y)) xs ys))))))))))
+
+(defn- with-cov
+  "A model of `type` with means `mean` and covariance `c` (no discount)."
+  [type mean c]
+  (assoc ((if (= :poisson type) d/poisson d/logistic) {:mean mean :var (map #(get-in c [% %]) (range (count mean))) :discount 1.0})
+         :c (double-array (apply concat c))))
+
+(defn- scaled [s c] (mapv (fn [r] (mapv #(* s (double %)) r)) c))
+
+(deftest the-joint-score-is-the-joint-marginal
+  ;; two correlated coefficients and a period's shared shock, integrated
+  ;; jointly over the rows: Laplace against brute-force quadrature over all
+  ;; three. Laplace's error is a few hundredths of a nat for the whole
+  ;; origin, whatever its rows, and grows slowly with the prior's width
+  (let [c [[0.8 0.3] [0.3 1.2]]
+        rows (fn [s n] (vec (for [i (range n)] {:x [1.0 (- (* 0.3 i) 1.5)] :y (odd? (* i 7 (inc i))) :shared [:t 0.2 (* s 0.5)]})))
+        quad (fn [s rs] (quadrature :logistic [-0.5 0.4 0.2] [[(* s 0.8) (* s 0.3) 0.0] [(* s 0.3) (* s 1.2) 0.0] [0.0 0.0 (* s 0.5)]]
+                                    (map #(conj (:x %) 1.0) rs) (map :y rs)))]
+    (doseq [[s n tol] [[1.0 1 0.03] [1.0 4 0.03] [1.0 12 0.03] [15.0 12 0.1]]]
+      (let [rs (rows s n)
+            lap (d/joint-score (with-cov :logistic [-0.5 0.4] (scaled s c)) rs)
+            q (quad s rs)]
+        (is (< (Math/abs (- lap q)) tol) [s n lap q])))
+    (testing "a Poisson model"
+      (let [rs [{:x [1.0 0.5] :y 2 :shared [:t 0.0 0.2]} {:x [1.0 -1.0] :y 0 :shared [:t 0.0 0.2]} {:x [1.0 1.0] :y 3 :shared [:t 0.0 0.2]}]
+            lap (d/joint-score (with-cov :poisson [0.2 0.3] [[0.3 0.1] [0.1 0.4]]) rs)
+            q (quadrature :poisson [0.2 0.3 0.0] [[0.3 0.1 0.0] [0.1 0.4 0.0] [0.0 0.0 0.2]] (map #(conj (:x %) 1.0) rs) (map :y rs))]
+        (is (< (Math/abs (- lap q)) 0.01) [lap q])))
+    (testing "a shared state of two dimensions, each row loading [1 e]"
+      (let [v [[0.4 0.1] [0.1 0.3]]
+            rs (vec (for [[e y] [[-1.0 false] [-0.3 true] [0.4 false] [1.0 true] [0.8 true]]]
+                      {:x [1.0] :y y :shared [:t [0.1 0.0] v] :load [1.0 e]}))
+            lap (d/joint-score (with-cov :logistic [-0.3] [[0.6]]) rs)
+            q (quadrature :logistic [-0.3 0.1 0.0] [[0.6 0.0 0.0] [0.0 0.4 0.1] [0.0 0.1 0.3]] (map #(into [1.0] (:load %)) rs) (map :y rs))]
+        (is (< (Math/abs (- lap q)) 0.03) [lap q])))
+    (testing "the discount applies as step's: the state's covariance over the discount"
+      (let [mdl (assoc (with-cov :logistic [-0.5 0.4] c) :discount 0.5)
+            rs (rows 1.0 4)]
+        (is (< (Math/abs (- (d/joint-score mdl rs) (d/joint-score (with-cov :logistic [-0.5 0.4] (scaled 2.0 c)) rs))) 1e-9))))))
+
+(deftest the-joint-score-with-nothing-uncertain-is-the-rows-likelihood
+  (let [mdl (with-cov :logistic [-0.5 0.4] [[0.0 0.0] [0.0 0.0]])
+        rs [{:x [1.0 0.5] :y true :o 0.1} {:x [1.0 -1.0] :y false} {:x [1.0 2.0] :y true :shared [:t 0.3 0.0]}]
+        ll (+ (Math/log (m/expit (+ -0.5 0.2 0.1))) (Math/log (- 1.0 (m/expit -0.9))) (Math/log (m/expit (+ -0.5 0.8 0.3))))]
+    (is (< (Math/abs (- (d/joint-score mdl rs) ll)) 1e-12))
+    (testing "a row's issued moments set its mean"
+      (is (< (Math/abs (- (d/joint-score mdl [{:x [1.0 0.5] :y true :f 1.0 :q 0.0}]) (Math/log (m/expit 1.0)))) 1e-12)))))
+
+(deftest a-row-is-scored-at-the-probability-it-was-issued
+  ;; a row issued over a mixture of offsets carries its mixture's log odds
+  ;; with no spread (:q 0): its mean is moved so that, under the
+  ;; coefficients' variance, it scores what was issued
+  (let [mdl (with-cov :logistic [-0.5 0.4] [[0.8 0.3] [0.3 1.2]])
+        f (m/logit 0.3)]
+    (is (< (Math/abs (- (d/joint-score mdl [{:x [1.0 0.5] :y true :f f :q 0.0}]) (Math/log 0.3))) 0.03))
+    (is (< (Math/abs (- (d/joint-score mdl [{:x [1.0 0.5] :y false :f f :q 0.0}]) (Math/log 0.7))) 0.03))))
+
+(defn- issued-rows
+  "`rows` as `avg` issues them now: each with every model's predictive and
+  the models' state."
+  [avg rows]
+  (let [st (d/issue-state avg)]
+    (mapv #(assoc % :issued (d/issued avg (:x %) (or (:o %) 0.0)) :issue-state st) rows)))
+
+(deftest joint-evidence-counts-a-coefficient-s-uncertainty-once-per-origin
+  ;; the models of sequential-evidence-counts-a-coefficient-s-uncertainty-once,
+  ;; scored as issued: per row (:issue) the unsure model's hedge is paid
+  ;; once per row and the gap grows with the rows; jointly, once per origin
+  (let [sure (d/logistic {:mean [-1.0 0.0] :var [1e-6 1e-6] :discount 1.0})
+        unsure (d/logistic {:mean [-1.0 0.0] :var [1e-6 4.0] :discount 1.0})
+        period (fn [n] (vec (for [i (range n)] {:x [1.0 (- (* 4.0 (/ (double i) (dec n))) 2.0)] :y (< (mod (* 7 i) 10) 5)})))
+        per-row (d/averaged {:sure sure :unsure unsure} {:forget 1.0 :evidence-at :issue})
+        joint (d/averaged {:sure sure :unsure unsure} {:forget 1.0 :evidence-at :issue-joint})
+        gap (fn [avg n] (let [e (d/evidence avg (issued-rows avg (period n)))] (- (e :unsure) (e :sure))))]
+    (is (> (Math/abs (gap per-row 200)) (* 3.0 (Math/abs (gap per-row 50)))) "per row: the gap grows with the rows")
+    (is (< (Math/abs (gap joint 200)) (+ 1.0 (Math/abs (gap joint 50)))) [(gap joint 50) (gap joint 200)])
+    (is (< (Math/abs (gap joint 1000)) 5.0) (gap joint 1000))
+    (testing "and a shock common to the rows, as issued, counted once: the evidence per origin stays bounded however many rows"
+      (let [a (d/logistic {:mean [-1.0] :var [1e-6] :discount 1.0})
+            b (d/logistic {:mean [0.5] :var [1e-6] :discount 1.0})
+            avg (d/averaged {:a a :b b} {:forget 1.0 :evidence-at :issue-joint})
+            per (d/averaged {:a a :b b} {:forget 1.0 :evidence-at :issue})
+            rows (fn [n] (vec (for [i (range n)] {:x [1.0] :y (< (mod (* 7 i) 10) 6) :shared [:t 0.0 1.0]})))
+            g (fn [avg n] (let [e (d/evidence avg (issued-rows avg (rows n)))] (- (e :b) (e :a))))]
+        (is (< (Math/abs (- (g avg 2000) (g avg 200))) 0.5) [(g avg 200) (g avg 2000)])
+        (testing "(with the coefficients known, the per-row rule integrates the shock jointly too: the two agree)"
+          (is (< (Math/abs (- (g avg 2000) (g per 2000))) 0.01) [(g avg 2000) (g per 2000)]))))))
+
+(deftest joint-evidence-is-per-origin
+  (let [a (d/logistic {:mean [-1.0 0.0] :var [0.5 2.0] :discount 0.95})
+        b (d/logistic {:mean [0.0 0.3] :var [1.0 1.0] :discount 0.95})
+        avg (d/averaged {:a a :b b} {:forget 1.0 :evidence-at :issue-joint})
+        g (m/rng 9)
+        o1 (issued-rows avg (rows g 20 [-0.5 1.0 0.0]))
+        avg2 (d/step avg o1)
+        o2 (issued-rows avg2 (rows g 20 [-0.5 1.0 0.0]))
+        e (fn [rs] (d/evidence avg2 rs))]
+    (testing "two origins' rows learned in one period: each origin scored jointly under its own issue state, the scores summed"
+      (doseq [k [:a :b]]
+        (is (< (Math/abs (- ((e (into o1 o2)) k) (+ ((e o1) k) ((e o2) k)))) 1e-9))
+        (is (< (Math/abs (- ((e o1) k) (d/joint-score (k (d/issue-state avg)) (map #(assoc % :f (get-in % [:issued k :f]) :q (get-in % [:issued k :q])) o1)))) 1e-12))))
+    (testing "the weights follow the joint evidence"
+      (let [ev (d/evidence avg o1) w (d/weights (d/step avg o1))]
+        (is (< (Math/abs (- (Math/log (/ (w :b) (w :a))) (- (ev :b) (ev :a)))) 1e-4))))
+    (is (thrown? clojure.lang.ExceptionInfo (d/evidence avg (mapv #(dissoc % :issue-state) o1))) "a row without its issue state")))
+
+(defn- delayed-stream-joint
+  "delayed-stream, each row also carrying the models' issue state."
+  [avg seed]
+  (let [g (m/rng seed)
+        lag 5 n 30 periods 120
+        sign (vec (for [_ (range (inc (quot periods lag)))] (if (< (m/next-double! g) 0.5) -1.0 1.0)))]
+    (loop [t 0 avg avg pending []]
+      (if (= t periods)
+        avg
+        (let [{ready true waiting false} (group-by #(<= (:known-at %) t) pending)
+              avg (d/step avg (mapv #(dissoc % :known-at) ready))
+              st (d/issue-state avg)
+              made (vec (for [_ (range n)]
+                          (let [z (if (< (m/next-double! g) 0.5) -1.0 1.0)
+                                x [1.0 z]]
+                            {:x x :y (< (m/next-double! g) (m/expit (* 3.0 (sign (quot t lag)) z)))
+                             :issued (d/issued avg x 0.0) :issue-state st :known-at (+ t lag)})))]
+          (recur (inc t) avg (into (vec waiting) made)))))))
+
+(deftest joint-evidence-does-not-reward-hindsight
+  ;; B fits only in hindsight (evidence-at-issue-does-not-reward-hindsight):
+  ;; scored jointly as issued it gets no weight, and the sequential rule at
+  ;; learn time, which also counts an origin once, still rewards it
+  (let [joint (delayed-stream-joint (d/averaged (two-models) {:forget 0.995 :evidence-at :issue-joint}) 3)
+        sq (delayed-stream-joint (d/averaged (two-models) {:forget 0.995 :evidence-at :sequential}) 3)]
+    (is (> (:base (d/weights joint)) 0.99) (d/weights joint))
+    (is (> (:b (d/weights sq)) 0.9) (d/weights sq))))
