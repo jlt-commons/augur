@@ -326,6 +326,62 @@
     (is (> (corr (map #(first (:m %)) ms) zs) 0.8))
     (is (> (corr (map #(second (:m %)) ms) us) 0.8))))
 
+;; --- the mode is reached from a prior far from it ----------------------------
+
+(defn- log-post
+  "The rows' log likelihood plus the log prior N(m, diag vs) at s (the
+  logistic rows of these tests, q 0), and its gradient."
+  [rows m vs s]
+  (let [terms (for [{:keys [f load y]} rows
+                    :let [eta (+ f (reduce + (map * load s)))
+                          p (m/expit eta)]]
+                [(Math/log (if y p (- 1.0 p))) (map #(* % (- (if y 1.0 0.0) p)) load)])
+        d (map - s m)]
+    [(- (reduce + (map first terms)) (* 0.5 (reduce + (map #(/ (* %1 %1) %2) d vs))))
+     (map - (apply map + (map second terms)) (map / d vs))]))
+
+(defn- at-mode? [rows m vs s]
+  (let [[f grad] (log-post rows m vs s)]
+    (and (every? #(< (Math/abs (double %)) 1e-6) grad)
+         (every? (fn [step] (<= (first (log-post rows m vs (map + s step))) f))
+                 (for [a [-1e-3 0.0 1e-3] b [-1e-3 0.0 1e-3]] (take (count s) [a b]))))))
+
+(def ^:private far-rows
+  (let [g (m/rng 42)]
+    (vec (for [_ (range 100)]
+           (let [e (- (* 4.0 (m/next-double! g)) 2.0)]
+             {:f -1.0 :q 0.0 :y (< (m/next-double! g) (m/expit (+ 1.3 (* 0.5 e)))) :load [1.0 e]})))))
+
+(deftest shared-marginal-reaches-the-mode-from-a-distant-prior
+  (testing "a state of two dimensions"
+    (doseq [mean [[0.0 0.0] [6.0 0.0] [-6.0 0.0] [10.0 5.0] [0.0 8.0]]]
+      (let [r (h/shared-marginal :logistic far-rows mean [[1.0 0.0] [0.0 1.0]])]
+        (is (at-mode? far-rows mean [1.0 1.0] (:z r)) [mean (:z r)]))))
+  (testing "a scalar state (Newton alone cycles here on balanced rows)"
+    (let [rows (vec (concat (repeat 10 {:f 0.0 :q 0.0 :y true :load [1.0]})
+                            (repeat 10 {:f 0.0 :q 0.0 :y false :load [1.0]})))]
+      (doseq [mean [-28.0 -23.0 0.0 23.0 28.0]]
+        (let [r (h/shared-marginal :logistic (mapv #(dissoc % :load) rows) mean 10.0)]
+          (is (at-mode? rows [mean] [10.0] [(:z r)]) [mean (:z r)])
+          (testing "and its state step"
+            (is (= (:z r) (:m (h/states-step {:m mean :v 10.0} (mapv #(dissoc % :load) rows) {:kind :logistic})))))))))
+  (testing "the vector state step"
+    (let [s (h/states-step {:m [6.0 0.0] :v [[1.0 0.0] [0.0 1.0]]} far-rows {:kind :logistic})]
+      (is (at-mode? far-rows [6.0 0.0] [1.0 1.0] (:m s))))))
+
+(deftest shared-marginal-unchanged-where-newton-converged
+  ;; the values v0.23.0 returned where its plain Newton converged, to the bit
+  (is (= {:z [2.0935598115214535 0.5688962855028024]
+          :v [[0.05659987915626603 0.014853010102569534] [0.014853010102569534 0.045740404240819516]]
+          :ll -57.45741531678003}
+         (h/shared-marginal :logistic far-rows [0.0 0.0] [[1.0 0.0] [0.0 1.0]])))
+  (is (= {:z [2.0956157939203477 0.5820800841692018]
+          :v [[0.05629736501354239 0.016275125140053814] [0.016275125140053814 0.04408825471113601]]
+          :ll -56.57192464210544}
+         (h/shared-marginal :logistic far-rows [0.3 -0.2] [[0.8 0.3] [0.3 0.5]])))
+  (is (= {:z 2.422770013392175 :v 0.06005886947517604 :ll -74.12362079225174}
+         (h/shared-marginal :logistic (mapv #(dissoc % :load) far-rows) 8.0 1.0))))
+
 (deftest a-shared-state-of-several-dimensions-is-checked
   (let [rows [{:f -1.0 :q 0.0 :y true :load [1.0 0.5]}]]
     (is (thrown? clojure.lang.ExceptionInfo (h/shared-marginal :logistic rows [0.0 0.0] [[1.0 0.0]])) "the variance not square")

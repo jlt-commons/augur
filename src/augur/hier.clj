@@ -707,12 +707,31 @@
                       (recur (inc i) (+ l (double x))))))))
         eye (vec (for [i (range d)] (vec (for [j (range d)] (if (= i j) 1.0 0.0)))))
         ipvw (fn [w] (mapv (fn [r e] (mapv + r e)) (mat-mul v w) eye))
-        s (loop [i 0 s m]
-            (let [[_ g w] (sum s)
+        ;; Newton alone can cycle from a prior far from the mode, so each step
+        ;; is cut to a length of 5 and halved until the log posterior does not
+        ;; fall. The prior's quadratic is u'Vu with s - m = V u, u carried
+        ;; along the steps (du solves (I + W V) du = g - u), so V is never
+        ;; inverted. A full step is taken as it was without the search.
+        ipwv (fn [w] (mapv (fn [r e] (mapv + r e)) (mat-mul w v) eye))
+        post-ll (fn [l u] (- (double l) (* 0.5 (reduce + 0.0 (map * u (mat-vec v u))))))
+        s (loop [i 0 s m u (vec (repeat d 0.0))]
+            (let [[l g w] (sum s)
                   delta (solve (ipvw w) (mapv - (mat-vec v g) (mapv - s m)))
-                  delta (mapv #(Math/max -5.0 (Math/min 5.0 (double %))) delta)
-                  s' (mapv + s delta)]
-              (if (or (>= i 100) (< (reduce max 0.0 (map #(Math/abs (double %)) delta)) 1e-10)) s' (recur (inc i) s'))))
+                  big (reduce max 0.0 (map #(Math/abs (double %)) delta))
+                  c (if (> big 5.0) (/ 5.0 big) 1.0)
+                  delta (if (< c 1.0) (mapv #(* c (double %)) delta) delta)
+                  du (mapv #(* c (double %)) (solve (ipwv w) (mapv - g u)))
+                  f0 (post-ll l u)
+                  tol (* 1e-10 (+ 1.0 (Math/abs f0)))
+                  step (loop [t 1.0]
+                         (let [s' (mapv + s (map #(* t (double %)) delta))
+                               u' (mapv + u (map #(* t (double %)) du))]
+                           (cond (>= (post-ll (first (sum s')) u') (- f0 tol)) [t s' u']
+                                 (< t 1e-6) nil
+                                 :else (recur (* 0.5 t)))))]
+              (if-let [[t s' u'] step]
+                (if (or (>= i 100) (< (* t (min big 5.0)) 1e-10)) s' (recur (inc i) s' u'))
+                s)))
         [l g w] (sum s)
         a (ipvw w)
         ;; the posterior variance (V^-1 + W)^-1 = (I + V W)^-1 V, column by
@@ -750,12 +769,24 @@
     (when (neg? v) (throw (ex-info "augur.hier/shared-marginal: a negative variance" {:v v})))
     (if (or (zero? v) (empty? rows))
       {:z m :v v :ll (double (first (sum m)))}
-      (let [z (loop [i 0 z m]
-                (let [[_ g h] (sum z)
+      (let [post-ll (fn [l z] (- (double l) (/ (* (- z m) (- z m)) (* 2.0 v))))
+            ;; Newton, its step cut to 5 and halved until the log posterior
+            ;; does not fall (Newton alone can cycle from a distant prior)
+            z (loop [i 0 z m]
+                (let [[l g h] (sum z)
                       g (- (double g) (/ (- z m) v))
                       h (+ (double h) (/ 1.0 v))
-                      z' (+ z (Math/max -5.0 (Math/min 5.0 (/ g h))))]
-                  (if (or (>= i 100) (< (Math/abs (- z' z)) 1e-10)) z' (recur (inc i) z'))))
+                      step (Math/max -5.0 (Math/min 5.0 (/ g h)))
+                      f0 (post-ll l z)
+                      tol (* 1e-10 (+ 1.0 (Math/abs f0)))
+                      z' (loop [t 1.0]
+                           (let [z' (+ z (* t step))]
+                             (cond (>= (post-ll (first (sum z')) z') (- f0 tol)) z'
+                                   (< t 1e-6) nil
+                                   :else (recur (* 0.5 t)))))]
+                  (cond (nil? z') z
+                        (or (>= i 100) (< (Math/abs (- z' z)) 1e-10)) z'
+                        :else (recur (inc i) z'))))
             [l _ h] (sum z)
             d (- z m)]
         {:z z :v (/ 1.0 (+ (double h) (/ 1.0 v)))
