@@ -619,6 +619,114 @@
                  [(* w (- (* yy eta) mu (m/log-gamma (+ 1.0 yy)))) (* w (- yy mu)) (* w mu)])
       (throw (ex-info "augur.hier: a shared state reads :logistic or :poisson rows" {:kind kind})))))
 
+(defn- solve
+  "x with a x = b, a a small square matrix [[...] ...], b a vector
+  (Gaussian elimination with partial pivoting)."
+  [a b]
+  (let [n (count b)
+        aug (into-array (map (fn [row bi] (double-array (conj (vec row) bi))) a b))]
+    (dotimes [col n]
+      (let [piv (apply max-key #(Math/abs (aget ^doubles (aget aug %) col)) (range col n))
+            tmp (aget aug col)]
+        (aset aug col (aget aug piv))
+        (aset aug piv tmp)
+        (let [^doubles pr (aget aug col) d (aget pr col)]
+          (doseq [r (range (inc col) n)]
+            (let [^doubles rr (aget aug r) f (/ (aget rr col) d)]
+              (dotimes [j (inc n)] (aset rr j (- (aget rr j) (* f (aget pr j))))))))))
+    (let [x (double-array n)]
+      (doseq [i (reverse (range n))]
+        (let [^doubles ri (aget aug i)]
+          (aset x i (/ (- (aget ri n) (loop [j (inc i) acc 0.0] (if (< j n) (recur (inc j) (+ acc (* (aget ri j) (aget x j)))) acc)))
+                       (aget ri i)))))
+      (vec x))))
+
+(defn- log-det
+  "The log determinant of a small matrix with a positive determinant (LU)."
+  ^double [a]
+  (let [n (count a)
+        m (into-array (map double-array a))]
+    (loop [col 0 acc 0.0]
+      (if (= col n)
+        acc
+        (let [piv (apply max-key #(Math/abs (aget ^doubles (aget m %) col)) (range col n))
+              tmp (aget m col)]
+          (aset m col (aget m piv))
+          (aset m piv tmp)
+          (let [^doubles pr (aget m col) d (aget pr col)]
+            (doseq [r (range (inc col) n)]
+              (let [^doubles rr (aget m r) f (/ (aget rr col) d)]
+                (dotimes [j n] (aset rr j (- (aget rr j) (* f (aget pr j)))))))
+            (recur (inc col) (+ acc (Math/log (Math/abs d))))))))))
+
+(defn- mat-vec [a x] (mapv (fn [row] (reduce + 0.0 (map * row x))) a))
+(defn- mat-mul [a b] (let [bt (apply mapv vector b)] (mapv (fn [row] (mapv #(reduce + 0.0 (map * row %)) bt)) a)))
+
+(defn- check-shared-n
+  "A state of several dimensions: m a vector of d means, v a d x d
+  variance with no negative diagonal, every row a :load of d numbers."
+  [rows m v]
+  (let [d (count m)]
+    (when-not (and (sequential? v) (= d (count v)) (every? #(and (sequential? %) (= d (count %))) v)
+                   (every? number? m) (every? #(every? number? %) v))
+      (throw (ex-info "augur.hier/shared-marginal: a state of d dimensions takes d means and a d x d variance" {:m m :v v})))
+    (when (some #(neg? (double (get-in v [% %]))) (range d))
+      (throw (ex-info "augur.hier/shared-marginal: a negative variance" {:v v})))
+    (when-let [bad (first (remove #(and (sequential? (:load %)) (= d (count (:load %))) (every? number? (:load %))) rows))]
+      (throw (ex-info "augur.hier/shared-marginal: each row loads on the state with d numbers (:load)" {:row bad :d d})))))
+
+(defn- shared-marginal-n
+  "shared-marginal for a state s ~ N(m, v) of several dimensions, each row
+  adding its :load times s. Newton in the form (I + V W) delta = V g - (s -
+  m), which needs no inverse of V, so a dimension known exactly (variance
+  0) stays at its mean."
+  [kind rows m v]
+  (check-shared-n rows m v)
+  (let [d (count m)
+        rows (vec rows)
+        n (count rows)
+        loads (object-array (map #(double-array (map double (:load %))) rows))
+        m (mapv double m)
+        v (mapv #(mapv double %) v)
+        ;; [l g w] at s: the rows' log likelihood, its gradient and minus its Hessian
+        sum (fn [s]
+              (let [^doubles sa (double-array s)
+                    g (double-array d)
+                    w (double-array (* d d))]
+                (loop [i 0 l 0.0]
+                  (if (= i n)
+                    [l (vec g) (vec (for [a (range d)] (vec (for [b (range d)] (aget w (+ (* a d) b))))))]
+                    (let [^doubles a (aget loads i)
+                          z (loop [j 0 acc 0.0] (if (< j d) (recur (inc j) (+ acc (* (aget a j) (aget sa j)))) acc))
+                          [x y u] (shared-terms kind (nth rows i) z)
+                          y (double y) u (double u)]
+                      (dotimes [j d]
+                        (aset g j (+ (aget g j) (* y (aget a j))))
+                        (dotimes [k d]
+                          (aset w (+ (* j d) k) (+ (aget w (+ (* j d) k)) (* u (aget a j) (aget a k))))))
+                      (recur (inc i) (+ l (double x))))))))
+        eye (vec (for [i (range d)] (vec (for [j (range d)] (if (= i j) 1.0 0.0)))))
+        ipvw (fn [w] (mapv (fn [r e] (mapv + r e)) (mat-mul v w) eye))
+        s (loop [i 0 s m]
+            (let [[_ g w] (sum s)
+                  delta (solve (ipvw w) (mapv - (mat-vec v g) (mapv - s m)))
+                  delta (mapv #(Math/max -5.0 (Math/min 5.0 (double %))) delta)
+                  s' (mapv + s delta)]
+              (if (or (>= i 100) (< (reduce max 0.0 (map #(Math/abs (double %)) delta)) 1e-10)) s' (recur (inc i) s'))))
+        [l g w] (sum s)
+        a (ipvw w)
+        ;; the posterior variance (V^-1 + W)^-1 = (I + V W)^-1 V, column by
+        ;; column, symmetrized; a dimension known exactly keeps variance 0
+        ;; (its roundoff can fall a hair below)
+        post (let [cols (mapv (fn [j] (solve a (mapv #(nth % j) v))) (range d))]
+               (vec (for [i (range d)]
+                      (vec (for [j (range d)
+                                 :let [x (* 0.5 (+ (nth (nth cols j) i) (nth (nth cols i) j)))]]
+                             (if (= i j) (Math/max 0.0 x) x))))))]
+    ;; at the mode V^-1 (s - m) = g, so the prior's quadratic is (s - m).g
+    {:z s :v post
+     :ll (- (double l) (* 0.5 (reduce + 0.0 (map * (mapv - s m) g))) (* 0.5 (log-det a)))}))
+
 (defn shared-marginal
   "One period's rows sharing a state z ~ N(m, v), added to each row's
   linear predictor: {:z the posterior mode, :v its variance, :ll the log
@@ -627,8 +735,15 @@
   moments of each row's linear predictor without z, its outcome and
   weight; `kind` :logistic or :poisson. With v = 0 the rows are scored at
   z = m, independently. Scored jointly, a shock the rows share is paid for
-  once, through z, rather than once per row."
+  once, through z, rather than once per row.
+
+  With m a vector of d means and v a d x d variance the state has d
+  dimensions and each row adds its :load (d numbers) times it: a common
+  shock and a slope on each row's exposure, say, with loads [1 e]. :z is
+  then the mode's vector and :v its variance matrix."
   [kind rows m v]
+  (if (sequential? m)
+    (shared-marginal-n kind rows m v)
   (let [m (double m) v (double v)
         sum (fn [z] (reduce (fn [[a b c] r] (let [[x y u] (shared-terms kind r z)] [(+ a x) (+ b y) (+ c u)]))
                             [0.0 0.0 0.0] rows))]
@@ -644,7 +759,7 @@
             [l _ h] (sum z)
             d (- z m)]
         {:z z :v (/ 1.0 (+ (double h) (/ 1.0 v)))
-         :ll (- (double l) (/ (* d d) (* 2.0 v)) (* 0.5 (Math/log1p (* v (double h)))))}))))
+         :ll (- (double l) (/ (* d d) (* 2.0 v)) (* 0.5 (Math/log1p (* v (double h)))))})))))
 
 (defn states-predict
   "A single AR(1) state {:m :v} run h periods forward under {:rho :sd}
@@ -660,6 +775,8 @@
   `states`, one node and one period at a time, its rho and sd fixed): the
   state's prior for the period {:m :v} (from `states-predict`) updated by
   the period's rows (see `shared-marginal`; :kind :logistic or :poisson).
+  A state of several dimensions ({:m [..] :v [[..] ..]}, each row's :load)
+  is updated the same way.
   {:m :v :ll}, :ll the rows' log marginal under the prior: the period's
   prequential score of the prior."
   [{:keys [m v]} rows {:keys [kind] :or {kind :logistic}}]

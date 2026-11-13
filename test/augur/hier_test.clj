@@ -259,3 +259,76 @@
         quad (Math/log (reduce + (for [i (range -8000 8000) :let [z (* i dz)]]
                                    (* dz (Math/exp (lik z)) (/ (Math/exp (- (/ (* z z) (* 2 v)))) (Math/sqrt (* 2 Math/PI v)))))))]
     (is (< (Math/abs (- quad (:ll (h/shared-marginal :logistic rows 0.0 v)))) 0.02))))
+
+;; --- a shared state of several dimensions, each row loading on it ------------
+
+(deftest shared-marginal-of-one-dimension-is-the-scalar-one
+  ;; a state [z] with every row loading 1 is the scalar shared state
+  (let [rows (vec (for [i (range 12)] {:f (- (* 0.1 i) 1.5) :q 0.2 :y (even? i)}))
+        s (h/shared-marginal :logistic rows 0.3 0.6)
+        v (h/shared-marginal :logistic (mapv #(assoc % :load [1.0]) rows) [0.3] [[0.6]])]
+    (is (< (Math/abs (- (:z s) (first (:z v)))) 1e-9))
+    (is (< (Math/abs (- (:v s) (ffirst (:v v)))) 1e-9))
+    (is (< (Math/abs (- (:ll s) (:ll v))) 1e-9))))
+
+(deftest shared-marginal-of-two-dimensions-matches-quadrature
+  ;; a level z and a slope u on each row's exposure e: the row's log odds
+  ;; f + z + u e; the Laplace marginal against a 2-d quadrature
+  (let [rows (vec (for [i (range 16)] {:f -1.0 :q 0.1 :y (or (< i 3) (and (> i 11) (odd? i))) :load [1.0 (- (* 0.2 i) 1.5)]}))
+        lik (fn [z u] (reduce + (for [{:keys [f q y load]} rows
+                                      :let [p (m/expit (/ (+ f z (* u (second load))) (Math/sqrt (+ 1.0 (/ (* Math/PI q) 8.0)))))]]
+                                  (Math/log (if y p (- 1.0 p))))))
+        vz 0.5 vu 0.3 d 0.02
+        quad (Math/log (reduce + (for [i (range -300 300) j (range -300 300)
+                                       :let [z (* i d) u (* j d)]]
+                                   (* d d (Math/exp (lik z u))
+                                      (/ (Math/exp (- (+ (/ (* z z) (* 2 vz)) (/ (* u u) (* 2 vu)))))
+                                         (* 2 Math/PI (Math/sqrt (* vz vu))))))))
+        lap (h/shared-marginal :logistic rows [0.0 0.0] [[vz 0.0] [0.0 vu]])]
+    (is (< (Math/abs (- quad (:ll lap))) 0.03) [quad (:ll lap)])
+    (testing "the posterior is tighter than the prior in both directions"
+      (is (< (get-in lap [:v 0 0]) vz))
+      (is (< (get-in lap [:v 1 1]) vu)))))
+
+(deftest shared-marginal-with-a-dimension-of-variance-zero
+  ;; a dimension known exactly (variance 0) stays at its mean, and the
+  ;; marginal is the one without it, its term moved into the offsets
+  (let [rows (vec (for [i (range 10)] {:f -0.5 :q 0.0 :y (< i 6) :load [1.0 (- i 4.5)]}))
+        two (h/shared-marginal :logistic rows [0.2 0.1] [[0.8 0.0] [0.0 0.0]])
+        one (h/shared-marginal :logistic (mapv (fn [r] (-> r (update :f + (* 0.1 (second (:load r)))) (dissoc :load))) rows) 0.2 0.8)]
+    (is (< (Math/abs (- (second (:z two)) 0.1)) 1e-12))
+    (is (< (Math/abs (get-in two [:v 1 1])) 1e-12))
+    (is (>= (get-in two [:v 1 1]) 0.0) "never below 0, so it can be the next period's prior")
+    (let [z0 (h/shared-marginal :logistic rows [0.0 0.1] [[0.0 0.0] [0.0 0.5]])]
+      (is (>= (get-in z0 [:v 0 0]) 0.0))
+      (is (map? (h/shared-marginal :logistic rows (:z z0) (:v z0)))))
+    (is (< (Math/abs (- (first (:z two)) (:z one))) 1e-8))
+    (is (< (Math/abs (- (:ll two) (:ll one))) 1e-8))))
+
+(deftest states-step-filters-a-shared-slope
+  ;; 80 places with fixed exposures; each period a common shock z_t and a
+  ;; slope u_t on the exposure, both AR(1). Filtered jointly, period by
+  ;; period, the state tracks both
+  (let [g (m/rng 12)
+        T 80
+        ar (fn [s] (vec (take T (iterate #(+ (* 0.6 %) (* s 0.8 (m/normal! g))) 0.0))))
+        zs (ar 0.6) us (ar 0.8)
+        es (vec (repeatedly 80 #(m/normal! g)))
+        steps (reductions (fn [{:keys [m v]} t]
+                            (let [prior {:m (mapv #(* 0.6 %) m)
+                                         :v [[(+ (* 0.36 (get-in v [0 0])) (* 0.36 0.64)) (* 0.36 (get-in v [0 1]))]
+                                             [(* 0.36 (get-in v [1 0])) (+ (* 0.36 (get-in v [1 1])) (* 0.64 0.64))]]}
+                                  rows (for [e es] {:f -1.0 :q 0.0 :load [1.0 e]
+                                                    :y (< (m/next-double! g) (m/expit (+ -1.0 (zs t) (* e (us t)))))})]
+                              (h/states-step prior rows {:kind :logistic})))
+                          {:m [0.0 0.0] :v [[0.36 0.0] [0.0 0.64]]} (range T))
+        ms (rest steps)]
+    (is (> (corr (map #(first (:m %)) ms) zs) 0.8))
+    (is (> (corr (map #(second (:m %)) ms) us) 0.8))))
+
+(deftest a-shared-state-of-several-dimensions-is-checked
+  (let [rows [{:f -1.0 :q 0.0 :y true :load [1.0 0.5]}]]
+    (is (thrown? clojure.lang.ExceptionInfo (h/shared-marginal :logistic rows [0.0 0.0] [[1.0 0.0]])) "the variance not square")
+    (is (thrown? clojure.lang.ExceptionInfo (h/shared-marginal :logistic rows [0.0 0.0] [[-1.0 0.0] [0.0 1.0]])) "a negative variance")
+    (is (thrown? clojure.lang.ExceptionInfo (h/shared-marginal :logistic [{:f -1.0 :q 0.0 :y true}] [0.0 0.0] [[1.0 0.0] [0.0 1.0]])) "a row without its loading")
+    (is (thrown? clojure.lang.ExceptionInfo (h/shared-marginal :logistic [{:f -1.0 :q 0.0 :y true :load [1.0]}] [0.0 0.0] [[1.0 0.0] [0.0 1.0]])) "a loading of the wrong length")))

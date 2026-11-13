@@ -432,8 +432,16 @@
                 :let [rs (by id)
                       effs (distinct (map :shared rs))
                       [_ mean var :as eff] (first effs)]]
-            (do (when-not (and (= 1 (count effs)) (= 3 (count eff)) (number? mean) (number? var) (>= (double var) 0.0))
-                  (throw (ex-info "augur.dynamic: a shared effect is [id mean variance], one per id, the variance at least 0" {:shared (vec effs)})))
+            (do (when-not (and (= 1 (count effs)) (= 3 (count eff))
+                               (if (sequential? mean)
+                                 ;; several dimensions: d means, a d x d variance, each row its :load
+                                 (let [d (count mean)]
+                                   (and (pos? d) (every? number? mean) (sequential? var) (= d (count var))
+                                        (every? #(and (sequential? %) (= d (count %)) (every? number? %)) var)
+                                        (every? #(>= (double (get-in var [% %])) 0.0) (range d))
+                                        (every? #(let [a (:load %)] (and (sequential? a) (= d (count a)) (every? number? a))) rs)))
+                                 (and (number? mean) (number? var) (>= (double var) 0.0))))
+                  (throw (ex-info "augur.dynamic: a shared effect is [id mean variance], one per id, the variance at least 0; with d means, a d x d variance and each row's :load of d numbers" {:shared (vec effs)})))
                 [eff rs])))))
 
 (defn- step-shared!
@@ -453,21 +461,39 @@
       (if (nil? eff)
         (doseq [{:keys [x y w o]} rs]
           (update-row! type mm c k (pick state x) y (double (or w 1.0)) (double (or o 0.0))))
-        (let [[_ mean var] eff
-              m1 (double-array k1)
-              c1 (double-array (* k1 k1))]
-          (dotimes [i k] (aset m1 i (aget mm i)))
-          (aset m1 k (double mean))
-          (dotimes [i k] (dotimes [j k] (aset c1 (+ (* i k1) j) (aget c (+ (* i k) j)))))
-          (aset c1 (+ (* k k1) k) (double var))
-          (doseq [{:keys [x y w o]} rs]
-            (let [x0 (pick state x)
-                  x1 (double-array k1)]
-              (dotimes [i k] (aset x1 i (aget x0 i)))
-              (aset x1 k 1.0)
-              (update-row! type m1 c1 k1 x1 y (double (or w 1.0)) (double (or o 0.0)))))
-          (dotimes [i k] (aset mm i (aget m1 i)))
-          (dotimes [i k] (dotimes [j k] (aset c (+ (* i k) j) (aget c1 (+ (* i k1) j))))))))))
+        (let [[_ mean var] eff]
+          (if (sequential? mean)
+            ;; a state of d dimensions, each row adding its :load times it
+            (let [d (count mean)
+                  kd (+ k d)
+                  m1 (double-array kd)
+                  c1 (double-array (* kd kd))]
+              (dotimes [i k] (aset m1 i (aget mm i)))
+              (dotimes [a d] (aset m1 (+ k a) (double (nth mean a))))
+              (dotimes [i k] (dotimes [j k] (aset c1 (+ (* i kd) j) (aget c (+ (* i k) j)))))
+              (dotimes [a d] (dotimes [b d] (aset c1 (+ (* (+ k a) kd) (+ k b)) (double (nth (nth var a) b)))))
+              (doseq [{:keys [x y w o load]} rs]
+                (let [x0 (pick state x)
+                      x1 (double-array kd)]
+                  (dotimes [i k] (aset x1 i (aget x0 i)))
+                  (dotimes [a d] (aset x1 (+ k a) (double (nth load a))))
+                  (update-row! type m1 c1 kd x1 y (double (or w 1.0)) (double (or o 0.0)))))
+              (dotimes [i k] (aset mm i (aget m1 i)))
+              (dotimes [i k] (dotimes [j k] (aset c (+ (* i k) j) (aget c1 (+ (* i kd) j))))))
+            (let [m1 (double-array k1)
+                  c1 (double-array (* k1 k1))]
+              (dotimes [i k] (aset m1 i (aget mm i)))
+              (aset m1 k (double mean))
+              (dotimes [i k] (dotimes [j k] (aset c1 (+ (* i k1) j) (aget c (+ (* i k) j)))))
+              (aset c1 (+ (* k k1) k) (double var))
+              (doseq [{:keys [x y w o]} rs]
+                (let [x0 (pick state x)
+                      x1 (double-array k1)]
+                  (dotimes [i k] (aset x1 i (aget x0 i)))
+                  (aset x1 k 1.0)
+                  (update-row! type m1 c1 k1 x1 y (double (or w 1.0)) (double (or o 0.0)))))
+              (dotimes [i k] (aset mm i (aget m1 i)))
+              (dotimes [i k] (dotimes [j k] (aset c (+ (* i k) j) (aget c1 (+ (* i k1) j))))))))))))
 
 (defn- shared-score
   "The log score of `rows`, some sharing an effect: the rows without one
@@ -478,11 +504,12 @@
   (when (= :linear kind)
     (throw (ex-info "augur.dynamic: a shared effect needs a logistic or Poisson model" {:kind kind})))
   (reduce + 0.0 (for [[eff rs] (shared-groups rows)]
-                  (if (or (nil? eff) (and (zero? (double (nth eff 2))) (zero? (double (nth eff 1)))))
+                  (if (or (nil? eff) (and (not (sequential? (nth eff 1))) (zero? (double (nth eff 2))) (zero? (double (nth eff 1)))))
                     ;; no effect, or one fixed at 0: the rows scored as they are
                     (reduce + 0.0 (map one rs))
                     (let [[_ mean var] eff]
-                      (:ll (hier/shared-marginal kind (for [r rs] (assoc (moments r) :y (:y r) :w (double (or (:w r) 1.0))))
+                      (:ll (hier/shared-marginal kind (for [r rs] (cond-> (assoc (moments r) :y (:y r) :w (double (or (:w r) 1.0)))
+                                                                    (sequential? mean) (assoc :load (:load r))))
                                                  mean var)))))))
 
 (defn step
@@ -490,7 +517,11 @@
   A row's :shared [id mean var] is a term common to every row of the
   period with that id, N(mean, var) on the linear predictor (a period's
   common shock): those rows are learned jointly with it and it is then
-  integrated out (logistic and Poisson models)."
+  integrated out (logistic and Poisson models). With mean a vector of d
+  and var a d x d matrix the term has d dimensions and each row adds its
+  :load (d numbers) times it: a common shock and a slope on each row's
+  exposure, with loads [1 e], so an exposure-weighted input is taught
+  about one observation a period too."
   [state rows]
   (if (= :averaged (:type state))
     (step-averaged state rows)
@@ -566,6 +597,15 @@
   (dynamic model averaging's evidence is the one-step-ahead predictive,
   Raftery, Karny & Ettler 2010); every row then needs its :issued.
 
+  :evidence-at :sequential scores a period's rows at learn time each
+  given the period's rows before it (`sequential-score`), as a linear
+  model's evidence always is: the log marginal of the period's rows with
+  the coefficients' uncertainty, and any effect the rows share, counted
+  once for the period. Scored independently, each row integrates the
+  coefficients on its own, so a model unsure of an input that differs
+  across a period's many rows is paid or rewarded for that uncertainty
+  once per row.
+
   :prior {name share} starts the weights from those shares instead of
   equal ones, the models not named sharing the rest evenly, and the
   forgetting flattens the weights toward them (w^forget prior^(1 -
@@ -574,8 +614,8 @@
   before."
   [models {:keys [forget weighting prior evidence-at]}]
   (need :averaged {:forget forget})
-  (when-not (contains? #{nil :learn :issue} evidence-at)
-    (throw (ex-info "augur.dynamic/averaged: :evidence-at must be :learn or :issue" {:evidence-at evidence-at})))
+  (when-not (contains? #{nil :learn :issue :sequential} evidence-at)
+    (throw (ex-info "augur.dynamic/averaged: :evidence-at must be :learn, :issue or :sequential" {:evidence-at evidence-at})))
   (when-let [bad (seq (remove (set (keys models)) (keys prior)))]
     (throw (ex-info "augur.dynamic/averaged: :prior names a model that is not averaged" {:models (vec bad)})))
   (when (or (some #(neg? (double %)) (vals prior)) (> (reduce + 0.0 (vals prior)) 1.000001))
@@ -600,6 +640,7 @@
     (cond-> {:type :averaged :kind (first kinds) :models models :forget (double forget)
              :w (into {} (for [k (keys models)] [k (/ 1.0 (count models))]))}
       (= :issue evidence-at) (assoc :evidence-at :issue)
+      (= :sequential evidence-at) (assoc :evidence-at :sequential)
       (seq prior) (as-> avg (let [named (reduce + 0.0 (map double (vals prior)))
                                   others (- (count models) (count prior))
                                   pi (into {} (for [k (keys models)]
@@ -652,12 +693,77 @@
 
 (defn- issue? [avg] (= :issue (:evidence-at avg)))
 
+(defn- score-row!
+  "The weighted log predictive of one row under (mm, c), c already
+  discounted; the row is then learned (`update-row!`)."
+  ^double [type ^doubles mm ^doubles c ^long k ^doubles x y ^double w ^double o]
+  (let [[f q] (moments mm c k x o 1.0)
+        f (double f) q (double q)
+        lp (case type
+             :logistic (let [p (m/expit (/ f (Math/sqrt (+ 1.0 (/ (* Math/PI q) 8.0)))))]
+                         (Math/log (Math/max 1e-300 (if (event? y) p (- 1.0 p)))))
+             :poisson (poisson-log-predictive f q (double y)))]
+    (update-row! type mm c k x y w o)
+    (* w lp)))
+
+(defn sequential-score
+  "The log probability of a period's `rows` under a logistic or Poisson
+  state, each row given the period's rows before it: the state discounted
+  as `step` does, then each row scored by its predictive and learned. Rows
+  sharing an effect (:shared, as `step`) are scored and learned with the
+  state augmented by it, which is integrated out after them. The chain
+  rule's log marginal of the period's rows, so the coefficients'
+  uncertainty and a shared effect are each counted once for the period,
+  not once per row (a linear model's evidence, `linear-step`, is already
+  this). Rows in the order given."
+  [{:keys [type k] :as state} rows]
+  (when-not (#{:logistic :poisson} type)
+    (throw (ex-info "augur.dynamic/sequential-score: a logistic or Poisson model" {:type type})))
+  (let [k (long k)
+        [mm c] (discounted state)]
+    (reduce
+     + 0.0
+     (for [[eff rs] (shared-groups rows)]
+       (if (nil? eff)
+         (reduce + 0.0 (for [{:keys [x y w o]} rs]
+                         (score-row! type mm c k (pick state x) y (double (or w 1.0)) (double (or o 0.0)))))
+         (let [[_ mean var] eff
+               vec? (sequential? mean)
+               d (if vec? (count mean) 1)
+               kd (+ k d)
+               m1 (double-array kd)
+               c1 (double-array (* kd kd))]
+           (dotimes [i k] (aset m1 i (aget ^doubles mm i)))
+           (dotimes [i k] (dotimes [j k] (aset c1 (+ (* i kd) j) (aget ^doubles c (+ (* i k) j)))))
+           (dotimes [a d]
+             (aset m1 (+ k a) (double (if vec? (nth mean a) mean)))
+             (dotimes [b d] (aset c1 (+ (* (+ k a) kd) (+ k b)) (double (if vec? (nth (nth var a) b) var)))))
+           (let [ll (reduce + 0.0 (for [{:keys [x y w o load]} rs]
+                                    (let [x0 (pick state x)
+                                          x1 (double-array kd)]
+                                      (dotimes [i k] (aset x1 i (aget ^doubles x0 i)))
+                                      (dotimes [a d] (aset x1 (+ k a) (double (if vec? (nth load a) 1.0))))
+                                      (score-row! type m1 c1 kd x1 y (double (or w 1.0)) (double (or o 0.0))))))]
+             (dotimes [i k] (aset ^doubles mm i (aget m1 i)))
+             (dotimes [i k] (dotimes [j k] (aset ^doubles c (+ (* i k) j) (aget c1 (+ (* i kd) j)))))
+             ll)))))))
+
+(defn- learn-score
+  "A model's evidence from a period's rows at learn time: each row given
+  the ones before it under :evidence-at :sequential (a logistic or
+  Poisson model), else `log-score`."
+  [avg mdl rows]
+  (if (and (= :sequential (:evidence-at avg)) (#{:logistic :poisson} (:type mdl)))
+    (sequential-score mdl rows)
+    (log-score mdl rows)))
+
 (defn evidence
   "Each averaged model's evidence from `rows` before it learns them, {name
   log probability}: the log score of each row by the predictive the model
   issued for it (:evidence-at :issue), else by its state now (a linear
-  model's sequentially, each row given the ones before it). What the
-  averaging weighs the models by."
+  model's sequentially, each row given the ones before it, and under
+  :evidence-at :sequential every model's). What the averaging weighs the
+  models by."
   [{:keys [models kind] :as avg} rows]
   (if (issue? avg)
     (into {} (for [k (keys models)]
@@ -669,7 +775,7 @@
     (into {} (for [[k mdl] models]
                [k (if (= :linear (:type mdl))
                     (let [[mm c] (discounted mdl)] (second (linear-step mdl mm c rows)))
-                    (log-score mdl rows))]))))
+                    (learn-score avg mdl rows))]))))
 
 
 
@@ -762,7 +868,7 @@
     [gains (assoc (update-vals pos #(/ % z)) base (/ (double scale) z))]))
 
 (defn- step-evidence [{:keys [models forget weighting ev n] :as avg} rows]
-  (let [ll (if (issue? avg) (evidence avg rows) (into {} (for [[k mdl] models] [k (log-score mdl rows)])))
+  (let [ll (if (issue? avg) (evidence avg rows) (into {} (for [[k mdl] models] [k (learn-score avg mdl rows)])))
         ev (into {} (for [[k e] ev] [k (+ (* forget (double e)) (double (ll k)))]))
         n (+ (* forget (double n)) (reduce + 0.0 (map #(double (or (:w %) 1.0)) rows)))
         [gains w] (evidence-weights ev n weighting)]
@@ -808,7 +914,7 @@
                   (into {} (for [[k mdl] models]
                              [k (if (= :linear (:type mdl))
                                   (let [[mm c] (discounted mdl)] (linear-step mdl mm c rows))
-                                  [nil (log-score mdl rows)])])))
+                                  [nil (learn-score avg mdl rows)])])))
         power (if (= :temper (:rule (:weighting avg))) (:power (:weighting avg)) 1.0)
         ll (update-vals stepped #(* power (second %)))
         top (apply max (vals ll))

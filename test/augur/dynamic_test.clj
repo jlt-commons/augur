@@ -692,3 +692,122 @@
                (d/step (d/linear {:mean [0.0] :var [1.0] :discount 1.0}) [{:x [1.0] :y 1.0 :shared [:t 0.0 1.0]}])))
   (is (thrown? clojure.lang.ExceptionInfo
                (d/step (d/logistic {:mean [0.0] :var [1.0] :discount 1.0}) [{:x [1.0] :y true :shared [:t 0.0 -1.0]}]))))
+
+;; --- shared effects of several dimensions: a common shock and a slope on each row's exposure ---
+
+(defn- slope-periods
+  "T periods of n rows: row i has a fixed exposure e_i; an intercept and a
+  period input w_t times e_i that carries nothing; the outcomes moved by a
+  period shock z_t + u_t e_i (sds s and su). `shared`: nil, :scalar (the
+  rows share [t 0 s^2], the slope left out) or :slope (they share
+  [t [0 0] [[s^2 0] [0 su^2]]], each loading [1 e_i])."
+  [seed T n s su shared]
+  (let [g (m/rng seed)
+        es (vec (for [i (range n)] (- (* 2.0 (/ (double i) (max 1 (dec n)))) 1.0)))]
+    (vec (for [t (range T)]
+           (let [w (m/normal! g) z (* s (m/normal! g)) u (* su (m/normal! g))]
+             (vec (for [e es]
+                    (cond-> {:x [1.0 (* w e)] :y (< (m/next-double! g) (m/expit (+ -1.0 z (* u e))))}
+                      (= :scalar shared) (assoc :shared [t 0.0 (* s s)])
+                      (= :slope shared) (assoc :shared [t [0.0 0.0] [[(* s s) 0.0] [0.0 (* su su)]]] :load [1.0 e])))))))))
+
+(deftest a-shared-slope-counts-a-period-once-for-an-exposure-input
+  (let [fresh (d/logistic {:mean [0.0 0.0] :var [4.0 1.0] :discount 1.0})
+        after (fn [n shared] (run fresh (slope-periods 5 40 n 1.0 1.0 shared)))]
+    (testing "a scalar shock leaves an exposure-weighted input taught once per row"
+      (is (> (/ (coef-var (after 200 :scalar) 1) (coef-var (after 2000 :scalar) 1)) 5.0)))
+    (testing "with the slope shared too, at most one observation of its variance a period"
+      ;; (exposures spread over [-1, 1]: under about 200 rows a period do not
+      ;; yet reach the bound, about 1/(1 + 40 w^2))
+      (let [r (/ (coef-var (after 200 :slope) 1) (coef-var (after 2000 :slope) 1))]
+        (is (< r 1.5) r))
+      (is (> (coef-var (after 2000 :slope) 1) (/ 1.0 (+ 1.0 40.0 (* 3.0 40.0))))))))
+
+(deftest a-shared-state-of-one-dimension-is-the-scalar-one
+  (let [fresh (d/logistic {:mean [0.0 0.0] :var [4.0 1.0] :discount 0.99})
+        scalar (slope-periods 6 10 20 1.0 0.0 :scalar)
+        vec1 (mapv (fn [rs] (mapv #(let [[id m v] (:shared %)] (assoc % :shared [id [m] [[v]]] :load [1.0])) rs)) scalar)
+        a (run fresh scalar) b (run fresh vec1)]
+    (is (every? #(< (Math/abs (double %)) 1e-9) (map - (d/means a) (d/means b))))
+    (is (every? #(< (Math/abs (double %)) 1e-9) (map - (vec (:c a)) (vec (:c b)))))
+    (is (< (Math/abs (- (d/log-score fresh (first scalar)) (d/log-score fresh (first vec1)))) 1e-9))
+    (testing "and the averaging's evidence, as issued"
+      (let [avg (d/averaged {:a fresh :b (d/logistic {:mean [-1.0 0.5] :var [1.0 1.0] :discount 0.99})} {:forget 1.0 :evidence-at :issue})
+            iss (fn [rs] (mapv #(assoc % :issued (d/issued avg (:x %) 0.0)) rs))
+            ea (d/evidence avg (iss (first scalar))) eb (d/evidence avg (iss (first vec1)))]
+        (is (every? #(< (Math/abs (- (ea %) (eb %))) 1e-9) [:a :b]))))))
+
+(deftest averaging-weighs-a-shared-slope-once
+  ;; two models that differ in an exposure slope; one period whose shock
+  ;; loads on the exposure in the slope's favour: read as 100 rows, or with
+  ;; only the scalar shock shared, it locks the weights; with the slope
+  ;; shared it moves them about as one row would
+  (let [a (d/logistic {:mean [-1.0 0.0] :var [1e-6 1e-6] :discount 1.0})
+        b (d/logistic {:mean [-1.0 1.0] :var [1e-6 1e-6] :discount 1.0})
+        es (vec (for [i (range 100)] (- (* 0.02 i) 1.0)))
+        rows (fn [shared] (vec (for [[i e] (map-indexed vector es)]
+                                 (cond-> {:x [1.0 e] :y (< (mod (* 7 i) 100) (+ 27 (* 30 e)))}
+                                   (= :scalar shared) (assoc :shared [:t 0.0 1.0])
+                                   (= :slope shared) (assoc :shared [:t [0.0 0.0] [[1.0 0.0] [0.0 1.0]]] :load [1.0 e])))))
+        w (fn [shared] (:b (d/weights (d/step (d/averaged {:a a :b b} {:forget 1.0}) (rows shared)))))]
+    (is (> (w nil) 0.99))
+    (is (> (w :scalar) 0.99))
+    (is (< (w :slope) 0.9) (w :slope))))
+
+(deftest a-shared-state-of-several-dimensions-is-refused-when-malformed
+  (let [mdl (d/logistic {:mean [0.0] :var [1.0] :discount 1.0})]
+    (doseq [bad [{:x [1.0] :y true :shared [:t [0.0 0.0] [[1.0 0.0] [0.0 1.0]]]}
+                 {:x [1.0] :y true :shared [:t [0.0 0.0] [[1.0 0.0] [0.0 1.0]]] :load [1.0]}
+                 {:x [1.0] :y true :shared [:t [0.0 0.0] [[1.0 0.0]]] :load [1.0 1.0]}
+                 {:x [1.0] :y true :shared [:t [0.0 0.0] [[1.0 0.0] [0.0 -1.0]]] :load [1.0 1.0]}]]
+      (is (thrown? clojure.lang.ExceptionInfo (d/step mdl [bad])) (pr-str bad)))))
+
+;; --- :evidence-at :sequential: a period's rows each given the ones before it ---
+
+(deftest sequential-evidence-of-one-row-is-the-log-score
+  (let [mdl (d/logistic {:mean [-1.0 0.3] :var [0.5 2.0] :discount 0.99})
+        r [{:x [1.0 1.5] :y true}]
+        avg (d/averaged {:a mdl} {:forget 1.0 :evidence-at :sequential})]
+    (is (< (Math/abs (- ((d/evidence avg r) :a) (d/log-score mdl r))) 1e-12))))
+
+(deftest sequential-evidence-counts-a-coefficient-s-uncertainty-once
+  ;; two models alike but for an input whose coefficient is 0 in both, one
+  ;; of them unsure of it (variance 4). Rows scored independently each
+  ;; integrate the coefficient on their own, so the unsure model's hedge
+  ;; is paid or rewarded once per row; given the rows before it, the
+  ;; coefficient is one quantity for the period
+  (let [sure (d/logistic {:mean [-1.0 0.0] :var [1e-6 1e-6] :discount 1.0})
+        unsure (d/logistic {:mean [-1.0 0.0] :var [1e-6 4.0] :discount 1.0})
+        period (fn [n] (vec (for [i (range n)] {:x [1.0 (- (* 4.0 (/ (double i) (dec n))) 2.0)] :y (< (mod (* 7 i) 10) 5)})))
+        gap (fn [ev n] (let [e (ev (period n))] (- (e :unsure) (e :sure))))
+        indep (d/averaged {:sure sure :unsure unsure} {:forget 1.0})
+        seqn (d/averaged {:sure sure :unsure unsure} {:forget 1.0 :evidence-at :sequential})
+        ev-i #(d/evidence indep %) ev-s #(d/evidence seqn %)]
+    (is (> (Math/abs (gap ev-i 200)) (* 3.0 (Math/abs (gap ev-i 50)))) "independent: the gap grows with the rows")
+    (is (< (Math/abs (gap ev-s 200)) (+ 1.0 (Math/abs (gap ev-s 50)))) [(gap ev-s 50) (gap ev-s 200)])
+    (testing "the weights it gives: one period of 200 rows locks them independently, not sequentially"
+      (let [w (fn [avg] (:unsure (d/weights (d/step avg (period 200)))))]
+        (is (or (> (w indep) 0.99) (< (w indep) 0.01)) (w indep))
+        (is (< 0.05 (w seqn) 0.95) (w seqn))))))
+
+(deftest sequential-evidence-with-a-shared-slope
+  ;; rows sharing a shock and a slope on their exposure: given the rows
+  ;; before it, each row's predictive carries what the period's rows have
+  ;; taught the shared state and the coefficients jointly. One shared
+  ;; dimension at variance 0 and mean 0 with a load of 1 is no effect
+  (let [mdl (d/logistic {:mean [-1.0 0.0] :var [0.5 1.0] :discount 0.99})
+        rows (first (slope-periods 7 1 60 1.0 1.0 :slope))
+        avg (d/averaged {:a mdl} {:forget 1.0 :evidence-at :sequential})
+        plain (mapv #(dissoc % :shared :load) rows)
+        zero (mapv #(assoc % :shared [:t [0.0] [[0.0]]] :load [1.0]) plain)]
+    (is (< (Math/abs (- ((d/evidence avg plain) :a) ((d/evidence avg zero) :a))) 1e-9))
+    (is (not= ((d/evidence avg plain) :a) ((d/evidence avg rows) :a)))
+    (testing "the averaging's step reads it"
+      (let [b (d/logistic {:mean [-1.0 1.0] :var [0.5 1.0] :discount 0.99})
+            two (d/averaged {:a mdl :b b} {:forget 1.0 :evidence-at :sequential})
+            e (d/evidence two rows)
+            w (d/weights (d/step two rows))]
+        (is (< (Math/abs (- (/ (w :b) (w :a)) (Math/exp (- (e :b) (e :a))))) 1e-6))))))
+
+(deftest evidence-at-takes-learn-issue-or-sequential
+  (is (thrown? clojure.lang.ExceptionInfo (d/averaged {:a (d/logistic {:mean [0.0] :var [1.0] :discount 1.0})} {:forget 1.0 :evidence-at :joint}))))
